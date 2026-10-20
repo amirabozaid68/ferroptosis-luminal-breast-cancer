@@ -1,0 +1,4141 @@
+---
+title: "Subtype-specific ferroptosis pathway activity and regulatory wiring in breast cancer: a discovery-validation transcriptomic study"
+author: "Amira Abozaid"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+The GSE96058 cohort represents primary breast tumors with no explicit indication of neoadjuvant therapy, supporting analysis of intrinsic tumor biology rather than treatment-induced transcriptional changes.
+#GSE96058 is suitable for studying intrinsic ferroptosis biology, not therapy response
+```{r Chunk 00 — Project root}
+# ----------------------------
+# Chunk 00 — Project root
+# ----------------------------
+
+if (requireNamespace("here", quietly = TRUE)) {
+  root <- here::here()
+} else {
+  root <- Sys.getenv("FERR_ROOT", unset = normalizePath(getwd()))
+}
+
+setwd(root)
+message("Project root: ", root)
+
+```
+
+```{r Chunk 01 — Project config}
+# ----------------------------
+# Chunk 01 — Project config + clean directory structure
+# ----------------------------
+
+project <- list(
+  name        = "Subtype_Ferroptosis_Wiring_BreastCancer",
+  dataset     = "GSE96058",
+  role        = "Discovery",
+  organism    = "Homo sapiens",
+  raw_type    = "RNAseq_table",
+  main_design = "PAM50_subtypes_plus_focused_ERpos_TNBC"
+)
+
+root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+
+paths <- list(
+  base       = file.path(root, project$dataset),
+  raw        = file.path(root, project$dataset, "01_raw"),
+  processed  = file.path(root, project$dataset, "02_processed"),
+  results    = file.path(root, project$dataset, "03_results"),
+  figures    = file.path(root, project$dataset, "03_results", "figures"),
+  tables     = file.path(root, project$dataset, "03_results", "tables"),
+  logs       = file.path(root, project$dataset, "04_logs"),
+  scripts    = file.path(root, project$dataset, "05_scripts"),
+  manuscript = file.path(root, project$dataset, "06_manuscript_outputs")
+)
+
+invisible(lapply(paths, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+project
+paths
+
+```
+
+
+```{r  Chunk 02 — Package}
+# ----------------------------
+# Chunk 02 — Packages + global specifications
+# ----------------------------
+
+cran_pkgs <- c(
+  "data.table", "readxl", "dplyr", "tibble", "stringr",
+  "ggplot2", "tidyr", "forcats", "readr", "matrixStats",
+  "patchwork", "igraph", "ggrepel", "scales", "purrr",
+  "broom", "rstatix", "effectsize", "pheatmap", "digest","rstatix"
+)
+
+to_install <- cran_pkgs[!cran_pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+invisible(lapply(cran_pkgs, library, character.only = TRUE))
+
+SPEC <- list(
+  seed          = 123,
+  min_axis_cov  = 0.50,
+  thr_abs_r     = 0.25,
+  B_downsample  = 500,
+  B_perm        = 2000
+)
+
+set.seed(SPEC$seed)
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(paths$logs, "02_sessionInfo.txt")
+)
+
+SPEC
+
+```
+
+```{r Chunk 03 — Load raw expression and clinical files}
+# ----------------------------
+# Chunk 03 — Load raw expression and clinical files
+# ----------------------------
+
+message("Raw path: ", paths$raw, " | exists: ", dir.exists(paths$raw))
+
+raw_files <- list.files(paths$raw, full.names = TRUE)
+stopifnot(dir.exists(paths$raw))
+stopifnot(length(raw_files) > 0)
+
+expr_file <- list.files(
+  paths$raw,
+  pattern = "gene_expression.*(csv\\.gz|txt\\.gz|tsv\\.gz|csv|txt|tsv)$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+clin_file <- list.files(
+  paths$raw,
+  pattern = "clinical|subtype|GSE96058_clinical_subtypes",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+stopifnot(length(expr_file) >= 1)
+stopifnot(length(clin_file) >= 1)
+
+expr_file <- expr_file[1]
+clin_file <- clin_file[1]
+
+message("Expression file: ", expr_file)
+message("Clinical file: ", clin_file)
+
+expr_dt <- data.table::fread(expr_file, fill = TRUE)
+
+if (grepl("\\.xlsx$", clin_file, ignore.case = TRUE)) {
+  clin_dt <- readxl::read_excel(clin_file) |> as.data.frame()
+} else {
+  clin_dt <- data.table::fread(clin_file) |> as.data.frame()
+}
+
+qc_raw <- tibble::tibble(
+  dataset       = project$dataset,
+  expression_file = basename(expr_file),
+  clinical_file   = basename(clin_file),
+  expr_rows     = nrow(expr_dt),
+  expr_cols     = ncol(expr_dt),
+  clin_rows     = nrow(clin_dt),
+  clin_cols     = ncol(clin_dt)
+)
+
+readr::write_csv(qc_raw, file.path(paths$tables, "03_qc_raw_files.csv"))
+
+qc_raw
+
+```
+This chunk takes long time 
+```{r Chunk 04 — Build expression matrix + collapse duplicated gene symbols}
+# ----------------------------
+# Chunk 04 — Build expression matrix + collapse duplicated gene symbols
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(tibble)
+  library(readr)
+})
+
+stopifnot(exists("expr_dt"))
+stopifnot(exists("clin_dt"))
+
+data.table::setDT(expr_dt)
+
+gene_col <- names(expr_dt)[1]
+data.table::setnames(expr_dt, gene_col, "SYMBOL")
+
+expr_dt[, SYMBOL := toupper(trimws(as.character(SYMBOL)))]
+expr_dt <- expr_dt[!is.na(SYMBOL) & SYMBOL != ""]
+
+sample_cols <- grep("^F\\d+$|^GSM\\d+", names(expr_dt), value = TRUE)
+stopifnot(length(sample_cols) > 100)
+
+non_num <- sample_cols[!vapply(expr_dt[, ..sample_cols], is.numeric, logical(1))]
+if (length(non_num) > 0) {
+  message("Converting ", length(non_num), " sample columns to numeric.")
+  expr_dt[, (sample_cols) := lapply(.SD, as.numeric), .SDcols = sample_cols]
+}
+
+USE_MEDIAN_COLLAPSE <- TRUE
+
+collapse_fun <- if (USE_MEDIAN_COLLAPSE) {
+  function(x) median(x, na.rm = TRUE)
+} else {
+  function(x) mean(x, na.rm = TRUE)
+}
+
+collapse_label <- ifelse(USE_MEDIAN_COLLAPSE, "median", "mean")
+
+expr_dt_collapsed <- expr_dt[
+  ,
+  lapply(.SD, collapse_fun),
+  by = SYMBOL,
+  .SDcols = sample_cols
+]
+
+expr_mat <- as.matrix(expr_dt_collapsed[, ..sample_cols])
+rownames(expr_mat) <- expr_dt_collapsed$SYMBOL
+
+storage.mode(expr_mat) <- "numeric"
+
+qc_expr_build <- tibble::tibble(
+  dataset              = project$dataset,
+  n_rows_raw_expr       = nrow(expr_dt),
+  n_unique_genes        = nrow(expr_mat),
+  n_samples             = ncol(expr_mat),
+  duplicated_gene_rows  = nrow(expr_dt) - nrow(expr_mat),
+  collapse_method       = collapse_label,
+  pct_missing_values    = mean(is.na(expr_mat)) * 100
+)
+
+readr::write_csv(
+  qc_expr_build,
+  file.path(paths$tables, "04_qc_expression_matrix_build.csv")
+)
+
+saveRDS(expr_mat, file.path(paths$processed, "04_expr_mat_gene_by_sample.rds"))
+saveRDS(clin_dt,  file.path(paths$processed, "04_clin_raw.rds"))
+
+message("Expression matrix built: ", nrow(expr_mat), " genes x ", ncol(expr_mat), " samples")
+qc_expr_build
+
+```
+
+```{r Chunk 05 — Map expression columns to sample IDs}
+# ----------------------------
+# Chunk 05 — Map expression columns to sample IDs
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(stringr)
+  library(tibble)
+  library(readr)
+})
+
+expr_mat <- readRDS(file.path(paths$processed, "04_expr_mat_gene_by_sample.rds"))
+clin_dt  <- readRDS(file.path(paths$processed, "04_clin_raw.rds")) |> as.data.frame()
+
+message("Expression matrix: ", nrow(expr_mat), " genes x ", ncol(expr_mat), " samples")
+message("Clinical table: ", nrow(clin_dt), " rows x ", ncol(clin_dt), " columns")
+
+stopifnot(ncol(expr_mat) > 100)
+stopifnot(nrow(clin_dt) > 100)
+
+extract_gsm_from_series_matrix <- function(fp) {
+  con <- if (grepl("\\.gz$", fp, ignore.case = TRUE)) gzfile(fp, "rt") else file(fp, "rt")
+  on.exit(close(con), add = TRUE)
+
+  lines <- readLines(con, warn = FALSE)
+  ix <- grep("^!Sample_geo_accession", lines)
+
+  if (length(ix) != 1) return(character(0))
+
+  tokens <- strsplit(lines[ix], "\t")[[1]]
+  gsm <- tokens[-1]
+  gsm <- gsub('"', "", gsm)
+  gsm[!is.na(gsm) & gsm != ""]
+}
+
+expr_sample_ids_original <- colnames(expr_mat)
+
+mapping_strategy <- NA_character_
+
+# Case A — expression columns already GSM-named
+if (all(stringr::str_detect(expr_sample_ids_original[seq_len(min(10, length(expr_sample_ids_original)))], "^GSM\\d+"))) {
+
+  mapping_strategy <- "expression columns already GSM IDs"
+  expr_mat_named <- expr_mat
+
+# Case B — expression columns already match clinical sample_id
+} else if ("sample_id" %in% names(clin_dt)) {
+
+  clin_ids <- as.character(clin_dt$sample_id)
+
+  overlap_direct <- sum(expr_sample_ids_original %in% clin_ids)
+
+  if (overlap_direct >= 0.80 * min(length(expr_sample_ids_original), length(clin_ids))) {
+
+    mapping_strategy <- "expression columns directly match clinical sample_id"
+    expr_mat_named <- expr_mat
+
+  } else if (
+    sum(stringr::str_detect(clin_ids, "^GSM\\d+")) >= 100 &&
+    length(clin_ids) == ncol(expr_mat) &&
+    anyDuplicated(clin_ids) == 0
+  ) {
+
+    mapping_strategy <- "renamed expression columns using clinical sample_id GSM order"
+    expr_mat_named <- expr_mat
+    colnames(expr_mat_named) <- clin_ids
+
+  } else {
+
+    sm_files <- list.files(
+      paths$raw,
+      pattern = "series_matrix\\.txt(\\.gz)?$",
+      full.names = TRUE,
+      ignore.case = TRUE
+    )
+
+    stopifnot(length(sm_files) >= 1)
+
+    gsm_list <- lapply(sm_files, extract_gsm_from_series_matrix)
+    gsm_n <- vapply(gsm_list, length, integer(1))
+
+    for (i in seq_along(sm_files)) {
+      message("Series matrix file: ", basename(sm_files[i]), " | GSM count: ", gsm_n[i])
+    }
+
+    hit <- which(gsm_n == ncol(expr_mat))
+
+    if (length(hit) == 1) {
+
+      mapping_strategy <- paste0("renamed expression columns using ", basename(sm_files[hit]))
+      expr_mat_named <- expr_mat
+      colnames(expr_mat_named) <- gsm_list[[hit]]
+
+    } else if (sum(gsm_n) == ncol(expr_mat)) {
+
+      gsm_all <- unlist(gsm_list)
+      stopifnot(anyDuplicated(gsm_all) == 0)
+
+      mapping_strategy <- "renamed expression columns using combined series_matrix GSM order"
+      expr_mat_named <- expr_mat
+      colnames(expr_mat_named) <- gsm_all
+
+    } else {
+      stop(
+        "Cannot map expression columns to sample IDs. ncol(expr_mat) = ",
+        ncol(expr_mat),
+        " | series_matrix GSM counts = ",
+        paste(gsm_n, collapse = ", ")
+      )
+    }
+  }
+
+} else {
+  stop("Clinical table has no sample_id column and expression columns are not GSM IDs.")
+}
+
+stopifnot(ncol(expr_mat_named) == ncol(expr_mat))
+stopifnot(anyDuplicated(colnames(expr_mat_named)) == 0)
+
+qc_mapping <- tibble::tibble(
+  dataset              = project$dataset,
+  n_expression_samples = ncol(expr_mat_named),
+  n_clinical_rows      = nrow(clin_dt),
+  mapping_strategy     = mapping_strategy,
+  first_5_expr_ids     = paste(head(colnames(expr_mat_named), 5), collapse = "; "),
+  first_5_clin_ids     = if ("sample_id" %in% names(clin_dt)) {
+    paste(head(as.character(clin_dt$sample_id), 5), collapse = "; ")
+  } else {
+    NA_character_
+  }
+)
+
+readr::write_csv(
+  qc_mapping,
+  file.path(paths$tables, "05_qc_sample_id_mapping.csv")
+)
+
+saveRDS(
+  expr_mat_named,
+  file.path(paths$processed, "05_expr_mat_named.rds")
+)
+
+saveRDS(
+  clin_dt,
+  file.path(paths$processed, "05_clin_raw_after_mapping.rds")
+)
+
+message("Sample ID mapping strategy: ", mapping_strategy)
+message("Saved: 05_expr_mat_named.rds")
+
+qc_mapping
+
+```
+Because expression has 3,273 samples but clinical has 2,986 rows, Chunk 06 will keep only matched clinical samples and preserve expression order.
+```{r Chunk 06 — Align expression and clinical samples}
+# ----------------------------
+# Chunk 06 — Align expression and clinical samples
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+expr_mat_named <- readRDS(file.path(paths$processed, "05_expr_mat_named.rds"))
+clin_dt        <- readRDS(file.path(paths$processed, "05_clin_raw_after_mapping.rds")) |>
+  as.data.frame()
+
+stopifnot("sample_id" %in% names(clin_dt))
+
+clin_dt$sample_id <- as.character(clin_dt$sample_id)
+
+expr_ids <- colnames(expr_mat_named)
+clin_ids <- clin_dt$sample_id
+
+matched_ids <- expr_ids[expr_ids %in% clin_ids]
+
+message("Expression samples: ", length(expr_ids))
+message("Clinical rows: ", length(clin_ids))
+message("Matched samples: ", length(matched_ids))
+
+stopifnot(length(matched_ids) > 100)
+
+expr_mat_aligned <- expr_mat_named[, matched_ids, drop = FALSE]
+clin_dt_aligned  <- clin_dt[match(matched_ids, clin_dt$sample_id), , drop = FALSE]
+
+stopifnot(ncol(expr_mat_aligned) == nrow(clin_dt_aligned))
+stopifnot(all(colnames(expr_mat_aligned) == clin_dt_aligned$sample_id))
+stopifnot(anyDuplicated(clin_dt_aligned$sample_id) == 0)
+
+qc_alignment <- tibble::tibble(
+  dataset              = project$dataset,
+  expression_samples   = length(expr_ids),
+  clinical_rows        = length(clin_ids),
+  matched_samples      = length(matched_ids),
+  expression_only      = length(setdiff(expr_ids, clin_ids)),
+  clinical_only        = length(setdiff(clin_ids, expr_ids)),
+  pct_expression_kept  = 100 * length(matched_ids) / length(expr_ids),
+  pct_clinical_matched = 100 * length(matched_ids) / length(clin_ids)
+)
+
+readr::write_csv(
+  qc_alignment,
+  file.path(paths$tables, "06_qc_expression_clinical_alignment.csv")
+)
+
+saveRDS(
+  expr_mat_aligned,
+  file.path(paths$processed, "06_expr_mat_aligned.rds")
+)
+
+saveRDS(
+  clin_dt_aligned,
+  file.path(paths$processed, "06_clin_aligned.rds")
+)
+
+message("Aligned expression matrix: ", nrow(expr_mat_aligned), " genes x ", ncol(expr_mat_aligned), " samples")
+message("Aligned clinical table: ", nrow(clin_dt_aligned), " rows x ", ncol(clin_dt_aligned), " columns")
+
+qc_alignment
+
+```
+
+```{r Chunk 07 — Standardize PAM50 and receptor annotations}
+# ----------------------------
+# Chunk 07 — Standardize PAM50 and receptor annotations
+# Purpose:
+#   Prepare robust subtype labels for the new design:
+#   1) PAM50 multi-subtype analysis
+#   2) focused ERpos vs TNBC contrast
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+  library(readr)
+})
+
+expr_mat <- readRDS(file.path(paths$processed, "06_expr_mat_aligned.rds"))
+clin_dt  <- readRDS(file.path(paths$processed, "06_clin_aligned.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+stopifnot(ncol(expr_mat) == nrow(clin_dt))
+stopifnot(all(colnames(expr_mat) == clin_dt$sample_id))
+
+# ----------------------------
+# Helper 1 — receptor standardization
+# ----------------------------
+
+std_status <- function(x, field_name = "") {
+  x_raw <- tolower(trimws(as.character(x)))
+
+  if (any(x_raw %in% c("1", "0"), na.rm = TRUE)) {
+    warning(
+      field_name,
+      ": integer encoding detected. Mapping 1=Positive, 0=Negative. ",
+      "Verify this is correct for this clinical file."
+    )
+  }
+
+  dplyr::case_when(
+    x_raw %in% c("pos", "positive", "+", "1", "yes", "y") ~ "Positive",
+    x_raw %in% c("neg", "negative", "-", "0", "no", "n")  ~ "Negative",
+    TRUE ~ NA_character_
+  )
+}
+
+# ----------------------------
+# Helper 2 — PAM50 standardization
+# ----------------------------
+
+std_pam50 <- function(x) {
+  x_raw <- tolower(trimws(as.character(x)))
+
+  dplyr::case_when(
+    x_raw %in% c("luminal a", "luma", "luminala", "lum_a", "lum a") ~ "LumA",
+    x_raw %in% c("luminal b", "lumb", "luminalb", "lum_b", "lum b") ~ "LumB",
+    x_raw %in% c("her2", "her2-enriched", "her2 enriched", "her2enriched", "her2+") ~ "HER2_enriched",
+    x_raw %in% c("basal", "basal-like", "basal like", "basallike") ~ "Basal",
+    x_raw %in% c("normal", "normal-like", "normal like", "normallike") ~ "Normal_like",
+    TRUE ~ NA_character_
+  )
+}
+
+# ----------------------------
+# Detect required columns
+# ----------------------------
+
+required_cols <- c("sample_id", "pam50_subtype")
+missing_required <- setdiff(required_cols, names(clin_dt))
+if (length(missing_required) > 0) {
+  stop("Missing required clinical columns: ", paste(missing_required, collapse = ", "))
+}
+
+receptor_cols <- c("ER_status", "PGR_status", "HER2_status")
+missing_receptors <- setdiff(receptor_cols, names(clin_dt))
+
+if (length(missing_receptors) > 0) {
+  warning(
+    "Missing receptor columns: ",
+    paste(missing_receptors, collapse = ", "),
+    ". Focused ERpos/TNBC contrast may be incomplete."
+  )
+}
+
+# ----------------------------
+# Standardize annotations
+# ----------------------------
+
+clin_std <- clin_dt %>%
+  mutate(
+    sample_id = as.character(sample_id),
+
+    ER_status_std = if ("ER_status" %in% names(.)) {
+      std_status(ER_status, "ER_status")
+    } else {
+      NA_character_
+    },
+
+    PGR_status_std = if ("PGR_status" %in% names(.)) {
+      std_status(PGR_status, "PGR_status")
+    } else {
+      NA_character_
+    },
+
+    HER2_status_std = if ("HER2_status" %in% names(.)) {
+      std_status(HER2_status, "HER2_status")
+    } else {
+      NA_character_
+    },
+
+    pam50_simple = std_pam50(pam50_subtype),
+
+    pam50_simple = factor(
+      pam50_simple,
+      levels = c("LumA", "LumB", "HER2_enriched", "Basal", "Normal_like")
+    ),
+
+    broad_receptor_group = dplyr::case_when(
+      ER_status_std == "Positive" & HER2_status_std == "Negative" ~ "ERpos_HER2neg",
+      ER_status_std == "Negative" & PGR_status_std == "Negative" & HER2_status_std == "Negative" ~ "TNBC",
+      HER2_status_std == "Positive" ~ "HER2pos",
+      TRUE ~ NA_character_
+    ),
+
+    focused_group_ERpos_TNBC = dplyr::case_when(
+      broad_receptor_group == "ERpos_HER2neg" ~ "ERpos",
+      broad_receptor_group == "TNBC" ~ "TNBC",
+      TRUE ~ NA_character_
+    ),
+
+    focused_group_ERpos_TNBC = factor(
+      focused_group_ERpos_TNBC,
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+# ----------------------------
+# QC tables
+# ----------------------------
+
+qc_pam50 <- clin_std %>%
+  dplyr::count(pam50_simple, name = "n") %>%
+  mutate(frac = n / sum(n))
+
+qc_receptor <- clin_std %>%
+  dplyr::count(ER_status_std, PGR_status_std, HER2_status_std, broad_receptor_group, name = "n") %>%
+  arrange(desc(n))
+
+qc_pam50_by_receptor <- clin_std %>%
+  dplyr::count(pam50_simple, broad_receptor_group, name = "n") %>%
+  arrange(pam50_simple, desc(n))
+
+qc_focused <- clin_std %>%
+  dplyr::count(focused_group_ERpos_TNBC, name = "n") %>%
+  mutate(frac = n / sum(n))
+
+readr::write_csv(qc_pam50, file.path(paths$tables, "07_qc_pam50_subtype_counts.csv"))
+readr::write_csv(qc_receptor, file.path(paths$tables, "07_qc_receptor_group_counts.csv"))
+readr::write_csv(qc_pam50_by_receptor, file.path(paths$tables, "07_qc_pam50_by_receptor_group.csv"))
+readr::write_csv(qc_focused, file.path(paths$tables, "07_qc_focused_ERpos_TNBC_counts.csv"))
+
+saveRDS(clin_std, file.path(paths$processed, "07_clin_standardized.rds"))
+
+message("Clinical annotations standardized.")
+message("PAM50 subtype counts:")
+print(qc_pam50)
+
+message("Focused ERpos/TNBC counts:")
+print(qc_focused)
+
+clin_std %>%
+  dplyr::select(sample_id, pam50_subtype, pam50_simple,
+                ER_status_std, PGR_status_std, HER2_status_std,
+                broad_receptor_group, focused_group_ERpos_TNBC) %>%
+  head()
+
+```
+
+
+```{r Chunk 08 — Build analysis cohorts}
+# ----------------------------
+# Chunk 08 — Build analysis cohorts
+# Purpose:
+#   1) Primary cohort: PAM50 multi-subtype analysis
+#      LumA, LumB, HER2-enriched, Basal, Normal-like
+#   2) Focused cohort: receptor-defined ERpos vs TNBC contrast
+#   3) Concordance labels for sensitivity analyses
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+expr_mat <- readRDS(file.path(paths$processed, "06_expr_mat_aligned.rds"))
+clin_std <- readRDS(file.path(paths$processed, "07_clin_standardized.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+stopifnot(ncol(expr_mat) == nrow(clin_std))
+stopifnot(all(colnames(expr_mat) == clin_std$sample_id))
+
+# ----------------------------
+# 08A — Primary PAM50 multi-subtype cohort
+# ----------------------------
+
+pam50_keep <- c("LumA", "LumB", "HER2_enriched", "Basal", "Normal_like")
+
+clin_pam50 <- clin_std %>%
+  filter(!is.na(pam50_simple), pam50_simple %in% pam50_keep) %>%
+  mutate(
+    pam50_simple = factor(
+      as.character(pam50_simple),
+      levels = pam50_keep
+    )
+  )
+
+expr_pam50 <- expr_mat[, clin_pam50$sample_id, drop = FALSE]
+
+stopifnot(all(colnames(expr_pam50) == clin_pam50$sample_id))
+
+qc_pam50_cohort <- clin_pam50 %>%
+  dplyr::count(pam50_simple, name = "n") %>%
+  mutate(
+    cohort = "PAM50_multi_subtype_primary",
+    frac = n / sum(n)
+  ) %>%
+  dplyr::select(cohort, pam50_simple, n, frac)
+
+# ----------------------------
+# 08B — Focused receptor-defined ERpos vs TNBC cohort
+# ----------------------------
+
+clin_focused <- clin_std %>%
+  filter(!is.na(focused_group_ERpos_TNBC)) %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+expr_focused <- expr_mat[, clin_focused$sample_id, drop = FALSE]
+
+stopifnot(all(colnames(expr_focused) == clin_focused$sample_id))
+
+qc_focused_cohort <- clin_focused %>%
+  dplyr::count(focused_group_ERpos_TNBC, name = "n") %>%
+  mutate(
+    cohort = "Focused_receptor_ERpos_vs_TNBC",
+    frac = n / sum(n)
+  ) %>%
+  dplyr::select(cohort, focused_group_ERpos_TNBC, n, frac)
+
+# ----------------------------
+# 08C — Concordance labels
+# These are not the primary filter yet.
+# They are saved for sensitivity analysis.
+# ----------------------------
+
+clin_concordance <- clin_std %>%
+  mutate(
+    receptor_pam50_concordance = dplyr::case_when(
+      broad_receptor_group == "ERpos_HER2neg" &
+        pam50_simple %in% c("LumA", "LumB") ~ "Concordant_ERpos_Luminal",
+
+      broad_receptor_group == "TNBC" &
+        pam50_simple == "Basal" ~ "Concordant_TNBC_Basal",
+
+      broad_receptor_group == "HER2pos" &
+        pam50_simple == "HER2_enriched" ~ "Concordant_HER2pos_HER2enriched",
+
+      is.na(broad_receptor_group) | is.na(pam50_simple) ~ "Insufficient_annotation",
+
+      TRUE ~ "Discordant_or_mixed"
+    )
+  )
+
+qc_concordance <- clin_concordance %>%
+  dplyr::count(receptor_pam50_concordance, name = "n") %>%
+  mutate(frac = n / sum(n)) %>%
+  arrange(desc(n))
+
+# ----------------------------
+# 08D — Save outputs
+# ----------------------------
+
+saveRDS(expr_pam50, file.path(paths$processed, "08_expr_PAM50_primary.rds"))
+saveRDS(clin_pam50, file.path(paths$processed, "08_clin_PAM50_primary.rds"))
+
+saveRDS(expr_focused, file.path(paths$processed, "08_expr_focused_ERpos_TNBC.rds"))
+saveRDS(clin_focused, file.path(paths$processed, "08_clin_focused_ERpos_TNBC.rds"))
+
+saveRDS(clin_concordance, file.path(paths$processed, "08_clin_with_concordance_labels.rds"))
+
+readr::write_csv(qc_pam50_cohort, file.path(paths$tables, "08_qc_PAM50_primary_cohort.csv"))
+readr::write_csv(qc_focused_cohort, file.path(paths$tables, "08_qc_focused_ERpos_TNBC_cohort.csv"))
+readr::write_csv(qc_concordance, file.path(paths$tables, "08_qc_receptor_PAM50_concordance.csv"))
+
+writeLines(
+  c(
+    "Chunk 08 cohort definitions",
+    "",
+    "Primary analysis cohort:",
+    "PAM50 multi-subtype cohort including LumA, LumB, HER2_enriched, Basal, Normal_like.",
+    "This is the main cohort for subtype-specific ferroptosis axis activity.",
+    "",
+    "Focused contrast:",
+    "Receptor-defined ERpos vs TNBC cohort.",
+    "This is retained as a focused biological contrast and sensitivity analysis.",
+    "",
+    "Concordance labels:",
+    "Used later to test receptor/PAM50 agreement and avoid overclaiming from discordant cases."
+  ),
+  con = file.path(paths$tables, "08_cohort_definition_note.txt")
+)
+
+message("Primary PAM50 cohort:")
+print(qc_pam50_cohort)
+
+message("Focused ERpos/TNBC cohort:")
+print(qc_focused_cohort)
+
+message("Receptor/PAM50 concordance:")
+print(qc_concordance)
+
+```
+
+
+```{r Chunk 09 — Handle technical replicates and cohort QC}
+# ----------------------------
+# Chunk 09 — Handle technical replicates and cohort QC
+# Purpose:
+#   Remove or collapse technical replicates before scoring.
+#   Apply consistently to:
+#     1) PAM50 primary cohort
+#     2) focused ERpos/TNBC cohort
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+  library(readr)
+})
+
+expr_pam50   <- readRDS(file.path(paths$processed, "08_expr_PAM50_primary.rds"))
+clin_pam50   <- readRDS(file.path(paths$processed, "08_clin_PAM50_primary.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+expr_focused <- readRDS(file.path(paths$processed, "08_expr_focused_ERpos_TNBC.rds"))
+clin_focused <- readRDS(file.path(paths$processed, "08_clin_focused_ERpos_TNBC.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+stopifnot(all(colnames(expr_pam50) == clin_pam50$sample_id))
+stopifnot(all(colnames(expr_focused) == clin_focused$sample_id))
+
+KEEP_PRIMARY_ONLY <- TRUE
+
+detect_replicates <- function(clin_tbl) {
+  clin_tbl %>%
+    mutate(
+      sample_id = as.character(sample_id),
+      patient_id = sub("([._]?repl\\d*)$", "", sample_id, ignore.case = TRUE),
+      is_repl = grepl("([._]?repl\\d*)$", sample_id, ignore.case = TRUE)
+    )
+}
+
+make_repSAFE <- function(expr_mat, clin_tbl, cohort_label) {
+
+  clin_tbl <- detect_replicates(clin_tbl)
+
+  rep_qc <- clin_tbl %>%
+    dplyr::count(is_repl, name = "n") %>%
+    mutate(cohort = cohort_label, KEEP_PRIMARY_ONLY = KEEP_PRIMARY_ONLY) %>%
+    dplyr::select(cohort, KEEP_PRIMARY_ONLY, is_repl, n)
+
+  if (KEEP_PRIMARY_ONLY) {
+
+    keep <- which(!clin_tbl$is_repl)
+
+    expr_out <- expr_mat[, clin_tbl$sample_id[keep], drop = FALSE]
+    clin_out <- clin_tbl[keep, , drop = FALSE]
+
+    note <- paste0(
+      cohort_label,
+      ": KEEP_PRIMARY_ONLY=TRUE | kept ",
+      ncol(expr_out),
+      " samples | dropped ",
+      sum(clin_tbl$is_repl),
+      " technical replicates."
+    )
+
+  } else {
+
+    uniq_pid <- unique(clin_tbl$patient_id)
+
+    expr_out <- sapply(uniq_pid, function(id) {
+      cols <- clin_tbl$sample_id[clin_tbl$patient_id == id]
+      if (length(cols) == 1) {
+        return(expr_mat[, cols])
+      } else {
+        return(rowMeans(expr_mat[, cols, drop = FALSE], na.rm = TRUE))
+      }
+    })
+
+    expr_out <- as.matrix(expr_out)
+    rownames(expr_out) <- rownames(expr_mat)
+    colnames(expr_out) <- uniq_pid
+
+    clin_out <- clin_tbl %>%
+      group_by(patient_id) %>%
+      slice(1) %>%
+      ungroup() %>%
+      mutate(sample_id = patient_id)
+
+    note <- paste0(
+      cohort_label,
+      ": KEEP_PRIMARY_ONLY=FALSE | collapsed to ",
+      ncol(expr_out),
+      " patient-level profiles."
+    )
+  }
+
+  stopifnot(ncol(expr_out) == nrow(clin_out))
+  stopifnot(all(colnames(expr_out) == clin_out$sample_id))
+  stopifnot(anyDuplicated(clin_out$sample_id) == 0)
+
+  list(
+    expr = expr_out,
+    clin = clin_out,
+    rep_qc = rep_qc,
+    note = note
+  )
+}
+
+pam50_repSAFE <- make_repSAFE(
+  expr_mat = expr_pam50,
+  clin_tbl = clin_pam50,
+  cohort_label = "PAM50_primary"
+)
+
+focused_repSAFE <- make_repSAFE(
+  expr_mat = expr_focused,
+  clin_tbl = clin_focused,
+  cohort_label = "Focused_ERpos_TNBC"
+)
+
+# ----------------------------
+# QC after replicate handling
+# ----------------------------
+
+qc_pam50_repSAFE <- pam50_repSAFE$clin %>%
+  dplyr::count(pam50_simple, name = "n") %>%
+  mutate(cohort = "PAM50_primary_repSAFE", frac = n / sum(n)) %>%
+  dplyr::select(cohort, pam50_simple, n, frac)
+
+qc_focused_repSAFE <- focused_repSAFE$clin %>%
+  dplyr::count(focused_group_ERpos_TNBC, name = "n") %>%
+  mutate(cohort = "Focused_ERpos_TNBC_repSAFE", frac = n / sum(n)) %>%
+  dplyr::select(cohort, focused_group_ERpos_TNBC, n, frac)
+
+qc_replicates <- bind_rows(
+  pam50_repSAFE$rep_qc,
+  focused_repSAFE$rep_qc
+)
+
+# ----------------------------
+# Save outputs
+# ----------------------------
+
+saveRDS(pam50_repSAFE$expr, file.path(paths$processed, "09_expr_PAM50_primary_repSAFE.rds"))
+saveRDS(pam50_repSAFE$clin, file.path(paths$processed, "09_clin_PAM50_primary_repSAFE.rds"))
+
+saveRDS(focused_repSAFE$expr, file.path(paths$processed, "09_expr_focused_ERpos_TNBC_repSAFE.rds"))
+saveRDS(focused_repSAFE$clin, file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds"))
+
+readr::write_csv(qc_replicates, file.path(paths$tables, "09_qc_replicate_detection.csv"))
+readr::write_csv(qc_pam50_repSAFE, file.path(paths$tables, "09_qc_PAM50_primary_repSAFE.csv"))
+readr::write_csv(qc_focused_repSAFE, file.path(paths$tables, "09_qc_focused_ERpos_TNBC_repSAFE.csv"))
+
+writeLines(
+  c(
+    pam50_repSAFE$note,
+    focused_repSAFE$note
+  ),
+  con = file.path(paths$tables, "09_replicate_handling_note.txt")
+)
+
+message("PAM50 primary cohort after replicate handling:")
+print(qc_pam50_repSAFE)
+
+message("Focused ERpos/TNBC cohort after replicate handling:")
+print(qc_focused_repSAFE)
+
+message("Replicate QC:")
+print(qc_replicates)
+
+```
+
+
+```{r Chunk 10 — Conservative ferroptosis axes}
+# ----------------------------
+# Chunk 10 — Conservative ferroptosis axes
+# Pipeline logic:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Principle:
+#   Use conservative CORE genes for axis scoring.
+#   Keep context-dependent markers only as SUPPORT genes for interpretation.
+#
+# Why:
+#   Downstream results depend on these axes.
+#   Therefore, avoid broad FerrDb-style lists that may include stress markers,
+#   general NRF2 targets, inflammatory genes, or context-dependent markers.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(readr)
+  library(stringr)
+})
+
+expr_pam50 <- readRDS(file.path(paths$processed, "09_expr_PAM50_primary_repSAFE.rds"))
+
+# ----------------------------
+# 10A — Conservative CORE axes for scoring
+# ----------------------------
+# These genes will be used for module scores.
+# They are selected for clearer pathway membership and lower risk of
+# misleading subtype-specific stress/inflammation effects.
+
+ferro_axes_core <- list(
+
+  # Cystine import and glutathione biosynthesis/recycling.
+  # Do not include NFE2L2 here because it is a broad stress TF.
+  Xc_GSH = c(
+    "SLC7A11", "SLC3A2",
+    "GCLC", "GCLM", "GSS", "GSR"
+  ),
+
+  # GPX4-centered selenium/selenoprotein machinery.
+  # Use genes directly linked to GPX4 synthesis/function.
+  GPX4_Selenium = c(
+    "GPX4",
+    "SEPHS2", "PSTK", "SEPSECS", "EEFSEC", "SECISBP2"
+  ),
+
+  # FSP1-CoQ antioxidant defense.
+  # AIFM2 is FSP1. CoQ biosynthesis genes retained.
+  # NQO1 excluded from core because it is broad NRF2/stress responsive.
+  FSP1_CoQ = c(
+    "AIFM2",
+    "PDSS1", "PDSS2",
+    "COQ2", "COQ6", "COQ7", "COQ9", "COQ10A", "COQ10B"
+  ),
+
+  # GCH1-BH4 antioxidant defense.
+  BH4_GCH1 = c(
+    "GCH1", "PTS", "SPR", "QDPR", "DHFR"
+  ),
+
+  # Mitochondrial ferroptosis defense.
+  # Keep this compact to avoid non-specific mitochondrial metabolism noise.
+  DHODH_Mito = c(
+    "DHODH", "CISD1", "CISD2"
+  ),
+
+  # Iron handling.
+  # HMOX1 excluded from core because it is highly stress/context-dependent.
+  Iron_Handling = c(
+    "TFRC", "SLC11A2", "STEAP3",
+    "FTH1", "FTL",
+    "NCOA4", "SLC40A1"
+  ),
+
+  # PUFA loading into phospholipids.
+  # MBOAT1/MBOAT2 excluded from core because they represent MUFA remodeling/
+  # suppressive compensation rather than canonical PUFA-loading susceptibility.
+  PUFA_Loading = c(
+    "ACSL4", "LPCAT3", "FADS1", "FADS2"
+  ),
+
+  # Enzymatic lipid peroxidation capacity.
+  # PTGS2 excluded from core because it is a marker of ferroptosis/inflammation,
+  # not a clean causal peroxidation-axis scoring gene.
+  Lipid_Peroxidation = c(
+    "ALOX5", "ALOX12", "ALOX15",
+    "POR", "NOX1", "NOX4"
+  )
+)
+
+ferro_axes_core <- lapply(
+  ferro_axes_core,
+  function(x) unique(toupper(trimws(x[!is.na(x) & x != ""])))
+)
+
+AXES_ORDER <- names(ferro_axes_core)
+
+# ----------------------------
+# 10B — Support genes, not used for primary scoring
+# ----------------------------
+# These genes can be reported later as marker-level support or sensitivity,
+# but they should not drive the main axis scores.
+
+ferro_support_genes <- list(
+
+  NRF2_Stress_Response = c(
+    "NFE2L2", "KEAP1", "HMOX1", "NQO1", "TXNRD1"
+  ),
+
+  Ferroptosis_Response_Markers = c(
+    "PTGS2", "CHAC1", "SAT1"
+  ),
+
+  MUFA_Remodeling_Resistance = c(
+    "ACSL3", "SCD", "MBOAT1", "MBOAT2"
+  ),
+
+  Additional_NEET_Mito = c(
+    "CISD3"
+  ),
+
+  Additional_Selenium_Redox = c(
+    "SCLY", "PRDX6"
+  )
+)
+
+ferro_support_genes <- lapply(
+  ferro_support_genes,
+  function(x) unique(toupper(trimws(x[!is.na(x) & x != ""])))
+)
+
+# ----------------------------
+# 10C — Axis membership tables
+# ----------------------------
+
+axis_gene_table_core <- tibble::tibble(
+  axis = rep(names(ferro_axes_core), lengths(ferro_axes_core)),
+  gene = unlist(ferro_axes_core, use.names = FALSE),
+  role = "core_scoring_gene"
+) %>%
+  arrange(axis, gene)
+
+axis_gene_table_support <- tibble::tibble(
+  support_group = rep(names(ferro_support_genes), lengths(ferro_support_genes)),
+  gene = unlist(ferro_support_genes, use.names = FALSE),
+  role = "support_not_primary_scoring"
+) %>%
+  arrange(support_group, gene)
+
+dup_core_genes <- axis_gene_table_core %>%
+  dplyr::count(gene, name = "n_axes") %>%
+  filter(n_axes > 1)
+
+if (nrow(dup_core_genes) > 0) {
+  stop(
+    "Core scoring genes overlap between axes: ",
+    paste(dup_core_genes$gene, collapse = ", "),
+    ". Fix before scoring."
+  )
+}
+
+# ----------------------------
+# 10D — Coverage QC
+# ----------------------------
+
+available_genes <- rownames(expr_pam50)
+
+axis_coverage_core <- axis_gene_table_core %>%
+  mutate(
+    present_in_GSE96058 = gene %in% available_genes
+  ) %>%
+  group_by(axis) %>%
+  summarise(
+    n_genes_defined = n(),
+    n_genes_present = sum(present_in_GSE96058),
+    coverage_frac = n_genes_present / n_genes_defined,
+    present_genes = paste(gene[present_in_GSE96058], collapse = "; "),
+    missing_genes = paste(gene[!present_in_GSE96058], collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(match(axis, AXES_ORDER))
+
+support_gene_coverage <- axis_gene_table_support %>%
+  mutate(
+    present_in_GSE96058 = gene %in% available_genes
+  ) %>%
+  group_by(support_group) %>%
+  summarise(
+    n_genes_defined = n(),
+    n_genes_present = sum(present_in_GSE96058),
+    coverage_frac = n_genes_present / n_genes_defined,
+    present_genes = paste(gene[present_in_GSE96058], collapse = "; "),
+    missing_genes = paste(gene[!present_in_GSE96058], collapse = "; "),
+    .groups = "drop"
+  )
+
+low_coverage_axes <- axis_coverage_core %>%
+  filter(coverage_frac < SPEC$min_axis_cov)
+
+if (nrow(low_coverage_axes) > 0) {
+  warning(
+    "Low-coverage CORE axes detected: ",
+    paste(low_coverage_axes$axis, collapse = ", "),
+    ". Review before scoring."
+  )
+}
+
+# ----------------------------
+# 10E — Save outputs
+# ----------------------------
+
+saveRDS(ferro_axes_core, file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds"))
+saveRDS(ferro_support_genes, file.path(paths$processed, "10_ferro_support_genes_not_scoring.rds"))
+saveRDS(AXES_ORDER, file.path(paths$processed, "10_axes_order.rds"))
+
+readr::write_csv(
+  axis_gene_table_core,
+  file.path(paths$tables, "10_CORE_ferroptosis_axis_gene_membership.csv")
+)
+
+readr::write_csv(
+  axis_gene_table_support,
+  file.path(paths$tables, "10_SUPPORT_ferroptosis_genes_not_primary_scoring.csv")
+)
+
+readr::write_csv(
+  axis_coverage_core,
+  file.path(paths$tables, "10_CORE_ferroptosis_axis_gene_coverage_GSE96058.csv")
+)
+
+readr::write_csv(
+  support_gene_coverage,
+  file.path(paths$tables, "10_SUPPORT_gene_coverage_GSE96058.csv")
+)
+
+writeLines(
+  c(
+    "Conservative ferroptosis axis strategy",
+    "",
+    "Main principle:",
+    "The primary analysis uses curated core pathway genes as ferroptosis axis scores.",
+    "Broad stress-response genes, inflammatory markers, and context-dependent markers are excluded from primary scoring.",
+    "",
+    "Primary scoring axes:",
+    paste0("- ", AXES_ORDER),
+    "",
+    "Genes excluded from primary scoring but retained as support markers:",
+    "- NFE2L2, KEAP1, HMOX1, NQO1, TXNRD1: broad NRF2/stress-response context.",
+    "- PTGS2, CHAC1, SAT1: response/marker genes, not clean axis activity genes.",
+    "- ACSL3, SCD, MBOAT1, MBOAT2: MUFA remodeling/resistance context, not PUFA-loading core.",
+    "- CISD3, SCLY, PRDX6: retained as support/sensitivity rather than core scoring genes.",
+    "",
+    "Interpretation rule:",
+    "Axis-level scores are the primary biological evidence.",
+    "Single genes are used later as marker-level support and experimental candidates.",
+    "",
+    "Rationale:",
+    "This avoids overclaiming from unstable single markers and improves portability across GSE96058, METABRIC, and GSE25066."
+  ),
+  con = file.path(paths$tables, "10_conservative_axis_strategy_note.txt")
+)
+
+message("Conservative core ferroptosis axes defined: ", length(ferro_axes_core))
+message("Core axis coverage:")
+print(axis_coverage_core)
+
+message("Support gene coverage:")
+print(support_gene_coverage)
+
+axis_gene_table_core
+
+```
+
+
+```{r Chunk 11 — Gene-wise Z-score matrices}
+# ----------------------------
+# Chunk 11 — Gene-wise Z-score matrices
+# Pipeline logic:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Convert expression to gene-wise Z-scores within each analysis cohort.
+#   This makes genes comparable within module scores.
+#
+# Outputs:
+#   1) PAM50 primary Z-matrix
+#   2) focused ERpos/TNBC Z-matrix
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(matrixStats)
+  library(tibble)
+  library(readr)
+})
+
+expr_pam50   <- readRDS(file.path(paths$processed, "09_expr_PAM50_primary_repSAFE.rds"))
+clin_pam50   <- readRDS(file.path(paths$processed, "09_clin_PAM50_primary_repSAFE.rds"))
+
+expr_focused <- readRDS(file.path(paths$processed, "09_expr_focused_ERpos_TNBC_repSAFE.rds"))
+clin_focused <- readRDS(file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds"))
+
+stopifnot(all(colnames(expr_pam50) == clin_pam50$sample_id))
+stopifnot(all(colnames(expr_focused) == clin_focused$sample_id))
+
+make_gene_z <- function(expr_mat, cohort_label) {
+
+  row_means <- rowMeans(expr_mat, na.rm = TRUE)
+  row_sds   <- matrixStats::rowSds(expr_mat, na.rm = TRUE)
+
+  row_sds[!is.finite(row_sds) | row_sds == 0] <- NA_real_
+
+  expr_z <- sweep(expr_mat, 1, row_means, "-")
+  expr_z <- sweep(expr_z, 1, row_sds, "/")
+  expr_z[!is.finite(expr_z)] <- NA_real_
+
+  qc_z <- tibble::tibble(
+    cohort = cohort_label,
+    n_genes = nrow(expr_z),
+    n_samples = ncol(expr_z),
+    pct_missing_z = mean(is.na(expr_z)) * 100,
+    n_zero_or_invalid_sd_genes = sum(is.na(row_sds)),
+    median_gene_sd_raw = median(row_sds, na.rm = TRUE)
+  )
+
+  list(expr_z = expr_z, qc = qc_z)
+}
+
+z_pam50 <- make_gene_z(
+  expr_mat = expr_pam50,
+  cohort_label = "PAM50_primary_repSAFE"
+)
+
+z_focused <- make_gene_z(
+  expr_mat = expr_focused,
+  cohort_label = "Focused_ERpos_TNBC_repSAFE"
+)
+
+saveRDS(
+  z_pam50$expr_z,
+  file.path(paths$processed, "11_expr_z_PAM50_primary_repSAFE.rds")
+)
+
+saveRDS(
+  z_focused$expr_z,
+  file.path(paths$processed, "11_expr_z_focused_ERpos_TNBC_repSAFE.rds")
+)
+
+qc_z_all <- dplyr::bind_rows(z_pam50$qc, z_focused$qc)
+
+readr::write_csv(
+  qc_z_all,
+  file.path(paths$tables, "11_qc_gene_wise_zscore_matrices.csv")
+)
+
+message("Gene-wise Z-score matrices created.")
+print(qc_z_all)
+
+```
+
+```{r Chunk 12 — Ferroptosis axis scores}
+# ----------------------------
+# Chunk 12 — Ferroptosis axis scores
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Compute:
+#     1) Weighted module scores (PRIMARY)
+#     2) Unweighted mean-Z scores (SENSITIVITY)
+#
+# Key rule:
+#   Only CORE axis genes are used for scoring.
+#   Missing genes are safely ignored per sample.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(purrr)
+  library(readr)
+})
+
+# Load inputs
+expr_z_pam50   <- readRDS(file.path(paths$processed, "11_expr_z_PAM50_primary_repSAFE.rds"))
+expr_z_focused <- readRDS(file.path(paths$processed, "11_expr_z_focused_ERpos_TNBC_repSAFE.rds"))
+
+ferro_axes_core <- readRDS(file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds"))
+
+# ----------------------------
+# 12A — Weighted module score function
+# ----------------------------
+
+compute_axis_scores <- function(expr_z, axes_list, cohort_label) {
+
+  # gene-level SD used as weights (from Z input → SD ~ 1 but NA genes excluded)
+  gene_sd <- matrixStats::rowSds(expr_z, na.rm = TRUE)
+
+  axis_scores_weighted <- list()
+  axis_scores_unweighted <- list()
+  axis_qc <- list()
+
+  for (ax in names(axes_list)) {
+
+    genes <- axes_list[[ax]]
+    genes_present <- intersect(genes, rownames(expr_z))
+
+    if (length(genes_present) == 0) {
+      warning("Axis ", ax, " has zero genes in matrix.")
+      next
+    }
+
+    sub_mat <- expr_z[genes_present, , drop = FALSE]
+    weights <- gene_sd[genes_present]
+
+    # Remove genes with NA weights
+    valid <- is.finite(weights) & !is.na(weights)
+    sub_mat <- sub_mat[valid, , drop = FALSE]
+    weights <- weights[valid]
+
+    # Normalize weights
+    weights <- weights / sum(weights)
+
+    # Weighted score
+    score_w <- colSums(sweep(sub_mat, 1, weights, "*"), na.rm = TRUE)
+
+    # Unweighted score (mean Z)
+    score_u <- colMeans(sub_mat, na.rm = TRUE)
+
+    axis_scores_weighted[[ax]]   <- score_w
+    axis_scores_unweighted[[ax]] <- score_u
+
+    axis_qc[[ax]] <- tibble::tibble(
+      cohort = cohort_label,
+      axis = ax,
+      n_genes_defined = length(genes),
+      n_genes_used = nrow(sub_mat),
+      coverage_frac = nrow(sub_mat) / length(genes)
+    )
+  }
+
+  scores_w <- as.data.frame(axis_scores_weighted)
+  scores_u <- as.data.frame(axis_scores_unweighted)
+
+  scores_w$sample_id <- colnames(expr_z)
+  scores_u$sample_id <- colnames(expr_z)
+
+  scores_w <- tibble::as_tibble(scores_w)
+  scores_u <- tibble::as_tibble(scores_u)
+
+  qc <- dplyr::bind_rows(axis_qc)
+
+  list(
+    weighted = scores_w,
+    unweighted = scores_u,
+    qc = qc
+  )
+}
+
+# ----------------------------
+# 12B — Compute scores
+# ----------------------------
+
+scores_pam50 <- compute_axis_scores(
+  expr_z = expr_z_pam50,
+  axes_list = ferro_axes_core,
+  cohort_label = "PAM50_primary"
+)
+
+scores_focused <- compute_axis_scores(
+  expr_z = expr_z_focused,
+  axes_list = ferro_axes_core,
+  cohort_label = "Focused_ERpos_TNBC"
+)
+
+# ----------------------------
+# 12C — Save outputs
+# ----------------------------
+
+saveRDS(scores_pam50$weighted,
+        file.path(paths$processed, "12_scores_weighted_PAM50.rds"))
+
+saveRDS(scores_pam50$unweighted,
+        file.path(paths$processed, "12_scores_unweighted_PAM50.rds"))
+
+saveRDS(scores_focused$weighted,
+        file.path(paths$processed, "12_scores_weighted_focused.rds"))
+
+saveRDS(scores_focused$unweighted,
+        file.path(paths$processed, "12_scores_unweighted_focused.rds"))
+
+qc_axes <- dplyr::bind_rows(scores_pam50$qc, scores_focused$qc)
+
+readr::write_csv(
+  qc_axes,
+  file.path(paths$tables, "12_qc_axis_gene_coverage_used.csv")
+)
+
+message("Axis scoring completed.")
+print(qc_axes)
+
+```
+```{r Chunk 13 — Add clinical labels to axis scores}
+
+# ----------------------------
+# Chunk 13 — Add clinical labels to axis scores
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(tidyr)
+})
+
+# ----------------------------
+# 13A — Load scores and clinical metadata
+# ----------------------------
+
+scores_w_pam50 <- readRDS(file.path(paths$processed, "12_scores_weighted_PAM50.rds"))
+scores_u_pam50 <- readRDS(file.path(paths$processed, "12_scores_unweighted_PAM50.rds"))
+
+scores_w_focused <- readRDS(file.path(paths$processed, "12_scores_weighted_focused.rds"))
+scores_u_focused <- readRDS(file.path(paths$processed, "12_scores_unweighted_focused.rds"))
+
+clin_pam50 <- readRDS(file.path(paths$processed, "09_clin_PAM50_primary_repSAFE.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+clin_focused <- readRDS(file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+# ----------------------------
+# 13A.5 — Diagnostic: detect actual axis columns in scores
+# ----------------------------
+
+axis_cols_defined <- names(readRDS(file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds")))
+
+# Identify which defined axes are actually present as columns
+axis_cols_in_pam50   <- intersect(axis_cols_defined, names(scores_w_pam50))
+axis_cols_in_focused <- intersect(axis_cols_defined, names(scores_w_focused))
+
+# Use the union that appears in at least one scores object
+axis_cols <- union(axis_cols_in_pam50, axis_cols_in_focused)
+
+# Report any mismatches
+missing_from_pam50   <- setdiff(axis_cols_defined, names(scores_w_pam50))
+missing_from_focused <- setdiff(axis_cols_defined, names(scores_w_focused))
+
+if (length(missing_from_pam50) > 0) {
+  warning(
+    "Axes defined in Chunk 10 but MISSING from PAM50 scores: ",
+    paste(missing_from_pam50, collapse = ", ")
+  )
+}
+if (length(missing_from_focused) > 0) {
+  warning(
+    "Axes defined in Chunk 10 but MISSING from focused scores: ",
+    paste(missing_from_focused, collapse = ", ")
+  )
+}
+
+message("Axis columns confirmed present in PAM50 scores:   ", paste(axis_cols_in_pam50,   collapse = ", "))
+message("Axis columns confirmed present in focused scores: ", paste(axis_cols_in_focused, collapse = ", "))
+
+stopifnot(length(axis_cols) > 0)
+
+# ----------------------------
+# 13B — Join clinical labels
+# ----------------------------
+
+meta_pam50 <- clin_pam50 %>%
+  dplyr::select(
+    sample_id,
+    pam50_simple,
+    ER_status_std,
+    PGR_status_std,
+    HER2_status_std,
+    broad_receptor_group,
+    focused_group_ERpos_TNBC
+  )
+
+meta_focused <- clin_focused %>%
+  dplyr::select(
+    sample_id,
+    pam50_simple,
+    ER_status_std,
+    PGR_status_std,
+    HER2_status_std,
+    broad_receptor_group,
+    focused_group_ERpos_TNBC
+  )
+
+scores_w_pam50_annot <- scores_w_pam50 %>%
+  left_join(meta_pam50, by = "sample_id")
+
+scores_u_pam50_annot <- scores_u_pam50 %>%
+  left_join(meta_pam50, by = "sample_id")
+
+scores_w_focused_annot <- scores_w_focused %>%
+  left_join(meta_focused, by = "sample_id")
+
+scores_u_focused_annot <- scores_u_focused %>%
+  left_join(meta_focused, by = "sample_id")
+
+# ----------------------------
+# 13C — Safety checks
+# ----------------------------
+
+stopifnot(nrow(scores_w_pam50_annot)   == nrow(clin_pam50))
+stopifnot(nrow(scores_u_pam50_annot)   == nrow(clin_pam50))
+stopifnot(nrow(scores_w_focused_annot) == nrow(clin_focused))
+stopifnot(nrow(scores_u_focused_annot) == nrow(clin_focused))
+
+stopifnot(!any(is.na(scores_w_pam50_annot$pam50_simple)))
+stopifnot(!any(is.na(scores_w_focused_annot$focused_group_ERpos_TNBC)))
+
+# ----------------------------
+# 13D — Long-format versions for plotting/statistics
+# Uses only axis columns confirmed present in each respective scores object
+# ----------------------------
+
+make_long_scores <- function(scores_tbl, cohort_label, score_type, group_col, defined_axes) {
+
+  # Only pivot axes that actually exist in this scores table
+  axes_to_use <- intersect(defined_axes, names(scores_tbl))
+
+  if (length(axes_to_use) == 0) {
+    stop("No axis columns found in scores table for cohort: ", cohort_label)
+  }
+
+  missing_axes <- setdiff(defined_axes, axes_to_use)
+  if (length(missing_axes) > 0) {
+    warning(
+      "Cohort '", cohort_label, "': pivoting ", length(axes_to_use),
+      " of ", length(defined_axes), " defined axes. Missing: ",
+      paste(missing_axes, collapse = ", ")
+    )
+  }
+
+  scores_tbl %>%
+    tidyr::pivot_longer(
+      cols = all_of(axes_to_use),
+      names_to = "axis",
+      values_to = "score"
+    ) %>%
+    mutate(
+      cohort     = cohort_label,
+      score_type = score_type,
+      axis       = factor(axis, levels = defined_axes),
+      comparison_group = as.character(.data[[group_col]])
+    )
+}
+
+long_w_pam50 <- make_long_scores(
+  scores_w_pam50_annot,
+  cohort_label  = "PAM50_primary",
+  score_type    = "weighted_primary",
+  group_col     = "pam50_simple",
+  defined_axes  = axis_cols_defined
+)
+
+long_u_pam50 <- make_long_scores(
+  scores_u_pam50_annot,
+  cohort_label  = "PAM50_primary",
+  score_type    = "unweighted_sensitivity",
+  group_col     = "pam50_simple",
+  defined_axes  = axis_cols_defined
+)
+
+long_w_focused <- make_long_scores(
+  scores_w_focused_annot,
+  cohort_label  = "Focused_ERpos_TNBC",
+  score_type    = "weighted_primary",
+  group_col     = "focused_group_ERpos_TNBC",
+  defined_axes  = axis_cols_defined
+)
+
+long_u_focused <- make_long_scores(
+  scores_u_focused_annot,
+  cohort_label  = "Focused_ERpos_TNBC",
+  score_type    = "unweighted_sensitivity",
+  group_col     = "focused_group_ERpos_TNBC",
+  defined_axes  = axis_cols_defined
+)
+
+scores_long_all <- bind_rows(
+  long_w_pam50,
+  long_u_pam50,
+  long_w_focused,
+  long_u_focused
+)
+
+# ----------------------------
+# 13E — Save outputs
+# ----------------------------
+
+saveRDS(scores_w_pam50_annot,   file.path(paths$processed, "13_scores_weighted_PAM50_annotated.rds"))
+saveRDS(scores_u_pam50_annot,   file.path(paths$processed, "13_scores_unweighted_PAM50_annotated.rds"))
+saveRDS(scores_w_focused_annot, file.path(paths$processed, "13_scores_weighted_focused_annotated.rds"))
+saveRDS(scores_u_focused_annot, file.path(paths$processed, "13_scores_unweighted_focused_annotated.rds"))
+saveRDS(scores_long_all,        file.path(paths$processed, "13_scores_long_all.rds"))
+
+readr::write_csv(scores_long_all, file.path(paths$tables, "13_scores_long_all.csv"))
+
+qc_scores_annot <- scores_long_all %>%
+  group_by(cohort, score_type, comparison_group, axis) %>%
+  summarise(
+    n            = sum(is.finite(score)),
+    mean_score   = mean(score, na.rm = TRUE),
+    median_score = median(score, na.rm = TRUE),
+    sd_score     = sd(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  qc_scores_annot,
+  file.path(paths$tables, "13_qc_axis_score_distributions_by_group.csv")
+)
+
+message("Clinical labels added to axis scores.")
+message("Axes used: ", paste(axis_cols_defined, collapse = ", "))
+print(qc_scores_annot)
+```
+
+```{r Chunk 14 — PAM50 multi-subtype axis comparison + visualization}
+# ----------------------------
+# Chunk 14 — PAM50 multi-subtype axis comparison + visualization
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Test whether conservative ferroptosis axis activity differs across:
+#   LumA, LumB, HER2_enriched, Basal, Normal_like
+#
+# Primary score:
+#   weighted_primary
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(forcats)
+  library(rstatix)
+  library(patchwork)
+})
+
+scores_long_all <- readRDS(file.path(paths$processed, "13_scores_long_all.rds"))
+
+pam50_w <- scores_long_all %>%
+  filter(
+    cohort == "PAM50_primary",
+    score_type == "weighted_primary",
+    !is.na(comparison_group),
+    is.finite(score)
+  ) %>%
+  mutate(
+    comparison_group = factor(
+      comparison_group,
+      levels = c("LumA", "LumB", "HER2_enriched", "Basal", "Normal_like")
+    )
+  )
+
+# ----------------------------
+# 14A — Global Kruskal-Wallis test per axis
+# ----------------------------
+
+kw_pam50 <- pam50_w %>%
+  group_by(axis) %>%
+  rstatix::kruskal_test(score ~ comparison_group) %>%
+  ungroup() %>%
+  mutate(
+    FDR_BH = p.adjust(p, method = "BH"),
+    significant_FDR_0.05 = FDR_BH < 0.05
+  ) %>%
+  arrange(FDR_BH)
+
+# ----------------------------
+# 14B — Pairwise Wilcoxon tests
+# ----------------------------
+
+pairwise_pam50 <- pam50_w %>%
+  group_by(axis) %>%
+  rstatix::pairwise_wilcox_test(
+    score ~ comparison_group,
+    p.adjust.method = "BH"
+  ) %>%
+  ungroup() %>%
+  arrange(axis, p.adj)
+
+# ----------------------------
+# 14C — Median axis pattern table
+# ----------------------------
+
+pam50_axis_pattern <- pam50_w %>%
+  group_by(axis, comparison_group) %>%
+  summarise(
+    n = n(),
+    median_score = median(score, na.rm = TRUE),
+    mean_score = mean(score, na.rm = TRUE),
+    sd_score = sd(score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(axis) %>%
+  mutate(
+    axis_median_centered = median_score - median(median_score, na.rm = TRUE),
+    highest_subtype = comparison_group[which.max(median_score)],
+    lowest_subtype = comparison_group[which.min(median_score)]
+  ) %>%
+  ungroup()
+
+# ----------------------------
+# 14D — Visualization 1: Faceted boxplot
+# ----------------------------
+
+p_box_pam50 <- ggplot(
+  pam50_w,
+  aes(x = comparison_group, y = score, fill = comparison_group)
+) +
+  geom_boxplot(
+    width = 0.65,
+    outlier.shape = NA,
+    alpha = 0.75,
+    linewidth = 0.35
+  ) +
+  geom_jitter(
+    width = 0.12,
+    height = 0,
+    alpha = 0.12,
+    size = 0.45
+  ) +
+  facet_wrap(~axis, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Ferroptosis axis activity across PAM50 breast cancer subtypes",
+    subtitle = "Primary weighted module scores using conservative core ferroptosis axes",
+    x = NULL,
+    y = "Weighted ferroptosis axis score"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# ----------------------------
+# 14E — Visualization 2: Heatmap-like median pattern plot
+# ----------------------------
+
+p_heat_pam50 <- ggplot(
+  pam50_axis_pattern,
+  aes(x = comparison_group, y = axis, fill = axis_median_centered)
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.2f", median_score)), size = 3.2) +
+  scale_y_discrete(limits = rev(levels(pam50_w$axis))) +
+  labs(
+    title = "Median ferroptosis axis pattern by PAM50 subtype",
+    subtitle = "Cell values show median weighted axis score; fill is centered within each axis",
+    x = NULL,
+    y = NULL,
+    fill = "Centered\nmedian"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# ----------------------------
+# 14F — Save tables and figures
+# ----------------------------
+
+readr::write_csv(
+  kw_pam50,
+  file.path(paths$tables, "14_PAM50_weighted_axis_KruskalWallis.csv")
+)
+
+readr::write_csv(
+  pairwise_pam50,
+  file.path(paths$tables, "14_PAM50_weighted_axis_pairwise_Wilcoxon.csv")
+)
+
+readr::write_csv(
+  pam50_axis_pattern,
+  file.path(paths$tables, "14_PAM50_weighted_axis_median_pattern.csv")
+)
+
+ggsave(
+  file.path(paths$figures, "14_PAM50_weighted_axis_boxplots.png"),
+  p_box_pam50,
+  width = 14,
+  height = 8,
+  dpi = 450,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "14_PAM50_weighted_axis_median_heatmap.png"),
+  p_heat_pam50,
+  width = 10,
+  height = 5.8,
+  dpi = 450,
+  bg = "white"
+)
+
+message("PAM50 weighted axis comparison completed.")
+message("Saved figures:")
+message("- 14_PAM50_weighted_axis_boxplots.png")
+message("- 14_PAM50_weighted_axis_median_heatmap.png")
+
+print(kw_pam50)
+p_box_pam50
+p_heat_pam50
+
+```
+This chunk indicate that TNBC tumors exhibit a ferroptosis-prone state characterized by coordinated activation of PUFA loading, mitochondrial and lipid peroxidation pathways, whereas ER+ tumors exhibit a ferroptosis-buffering state driven by GPX4-dependent and alternative antioxidant systems.
+
+```{r Chunk 15 — ERpos vs TNBC ferroptosis signature}
+# ----------------------------
+# Chunk 15 — ERpos vs TNBC ferroptosis signature
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Define focused ERpos vs TNBC ferroptosis axis signature.
+#   Uses:
+#     - Wilcoxon test
+#     - BH-FDR
+#     - Cliff's delta computed manually
+#     - Forest plot visualization
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(tidyr)
+})
+
+scores_long_all <- readRDS(file.path(paths$processed, "13_scores_long_all.rds"))
+
+focused_w <- scores_long_all %>%
+  filter(
+    cohort == "Focused_ERpos_TNBC",
+    score_type == "weighted_primary",
+    comparison_group %in% c("ERpos", "TNBC"),
+    is.finite(score)
+  ) %>%
+  mutate(
+    comparison_group = factor(comparison_group, levels = c("ERpos", "TNBC"))
+  )
+
+stopifnot(all(c("ERpos", "TNBC") %in% focused_w$comparison_group))
+
+# ----------------------------
+# 15A — Safe manual Cliff's delta
+# Positive value = higher score in TNBC than ERpos
+# ----------------------------
+
+cliffs_delta_tnbc_vs_erpos <- function(x_er, x_tn) {
+  x_er <- x_er[is.finite(x_er)]
+  x_tn <- x_tn[is.finite(x_tn)]
+
+  if (length(x_er) < 5 || length(x_tn) < 5) return(NA_real_)
+
+  diff_mat <- outer(x_tn, x_er, FUN = "-")
+
+  delta <- (sum(diff_mat > 0) - sum(diff_mat < 0)) /
+    (length(x_tn) * length(x_er))
+
+  as.numeric(delta)
+}
+
+# ----------------------------
+# 15B — Wilcoxon + FDR + effect size
+# ----------------------------
+
+signature_table <- focused_w %>%
+  group_by(axis) %>%
+  summarise(
+    n_ERpos = sum(comparison_group == "ERpos"),
+    n_TNBC  = sum(comparison_group == "TNBC"),
+
+    median_ERpos = median(score[comparison_group == "ERpos"], na.rm = TRUE),
+    median_TNBC  = median(score[comparison_group == "TNBC"], na.rm = TRUE),
+
+    mean_ERpos = mean(score[comparison_group == "ERpos"], na.rm = TRUE),
+    mean_TNBC  = mean(score[comparison_group == "TNBC"], na.rm = TRUE),
+
+    delta_median_TNBC_minus_ERpos = median_TNBC - median_ERpos,
+
+    cliffs_delta_TNBC_vs_ERpos = cliffs_delta_tnbc_vs_erpos(
+      score[comparison_group == "ERpos"],
+      score[comparison_group == "TNBC"]
+    ),
+
+    p_value = suppressWarnings(
+      wilcox.test(score ~ comparison_group)$p.value
+    ),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    FDR_BH = p.adjust(p_value, method = "BH"),
+    direction = case_when(
+      cliffs_delta_TNBC_vs_ERpos > 0 ~ "TNBC higher",
+      cliffs_delta_TNBC_vs_ERpos < 0 ~ "ERpos higher",
+      TRUE ~ "No shift"
+    ),
+    signature_support = case_when(
+      FDR_BH < 0.05 & abs(cliffs_delta_TNBC_vs_ERpos) >= 0.20 ~ "Strong",
+      FDR_BH < 0.05 & abs(cliffs_delta_TNBC_vs_ERpos) >= 0.10 ~ "Moderate",
+      FDR_BH < 0.05 ~ "Statistical_only",
+      TRUE ~ "Not_significant"
+    )
+  ) %>%
+  arrange(FDR_BH)
+
+# ----------------------------
+# 15C — Forest plot
+# ----------------------------
+
+plot_tbl <- signature_table %>%
+  mutate(
+    axis = factor(axis, levels = rev(axis))
+  )
+
+p_forest <- ggplot(
+  plot_tbl,
+  aes(x = cliffs_delta_TNBC_vs_ERpos, y = axis)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+  geom_segment(
+    aes(x = 0, xend = cliffs_delta_TNBC_vs_ERpos, y = axis, yend = axis),
+    linewidth = 0.8
+  ) +
+  geom_point(aes(shape = signature_support), size = 3.2) +
+  labs(
+    title = "Focused ERpos vs TNBC ferroptosis axis signature",
+    subtitle = "Cliff's delta from weighted axis scores; positive values indicate higher TNBC activity",
+    x = "Cliff's delta (TNBC vs ERpos)",
+    y = NULL,
+    shape = "Evidence"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# ----------------------------
+# 15D — Save outputs
+# ----------------------------
+
+readr::write_csv(
+  signature_table,
+  file.path(paths$tables, "15_ERpos_TNBC_weighted_axis_signature.csv")
+)
+
+ggsave(
+  file.path(paths$figures, "15_ERpos_TNBC_weighted_axis_forest.png"),
+  p_forest,
+  width = 7.5,
+  height = 4.8,
+  dpi = 450,
+  bg = "white"
+)
+
+message("Focused ERpos vs TNBC axis signature completed.")
+print(signature_table)
+
+p_forest
+
+```
+Downsampling analysis demonstrated that the TNBC-associated increase in PUFA loading, mitochondrial ferroptosis defense (DHODH axis), and lipid peroxidation capacity remained highly consistent across 500 resampling iterations, confirming that these signals are not driven by the large ERpos sample size. In contrast, alternative antioxidant pathways (FSP1-CoQ and BH4) showed weak and unstable differences, indicating that they do not contribute robustly to subtype separation.
+ 
+Results:
+TNBC = ferroptosis-primed state
+
+Driven by:
+
+PUFA loading ↑
+Lipid peroxidation ↑
+Mitochondrial DHODH axis ↑
+ERpos = ferroptosis-buffered state
+
+Driven by:
+
+GPX4–selenium system ↑ (VERY robust)
+
+```{r Chunk 16 — Downsampling robustness for ERpos vs TNBC signature}
+# ----------------------------
+# Chunk 16 — Downsampling robustness for ERpos vs TNBC signature
+# Pipeline:
+#   Axis score → marker genes → robustness → wiring → validation
+#
+# Purpose:
+#   Address ERpos/TNBC imbalance by repeatedly downsampling ERpos to TNBC size.
+#   Robust axes should keep the same direction and remain significant frequently.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+})
+
+set.seed(SPEC$seed)
+
+scores_long_all <- readRDS(file.path(paths$processed, "13_scores_long_all.rds"))
+
+focused_w <- scores_long_all %>%
+  filter(
+    cohort == "Focused_ERpos_TNBC",
+    score_type == "weighted_primary",
+    comparison_group %in% c("ERpos", "TNBC"),
+    is.finite(score)
+  ) %>%
+  mutate(
+    comparison_group = factor(comparison_group, levels = c("ERpos", "TNBC"))
+  )
+
+axis_names <- levels(focused_w$axis)
+
+n_er <- sum(focused_w$comparison_group == "ERpos") / length(axis_names)
+n_tn <- sum(focused_w$comparison_group == "TNBC") / length(axis_names)
+
+B_down <- SPEC$B_downsample
+
+cliffs_delta_tnbc_vs_erpos <- function(x_er, x_tn) {
+  x_er <- x_er[is.finite(x_er)]
+  x_tn <- x_tn[is.finite(x_tn)]
+  if (length(x_er) < 5 || length(x_tn) < 5) return(NA_real_)
+
+  diff_mat <- outer(x_tn, x_er, FUN = "-")
+  (sum(diff_mat > 0) - sum(diff_mat < 0)) / (length(x_tn) * length(x_er))
+}
+
+run_one_downsample <- function(b) {
+
+  er_ids <- focused_w %>%
+    filter(comparison_group == "ERpos") %>%
+    distinct(sample_id) %>%
+    pull(sample_id)
+
+  tn_ids <- focused_w %>%
+    filter(comparison_group == "TNBC") %>%
+    distinct(sample_id) %>%
+    pull(sample_id)
+
+  er_keep <- sample(er_ids, size = length(tn_ids), replace = FALSE)
+
+  dat_b <- focused_w %>%
+    filter(sample_id %in% c(er_keep, tn_ids))
+
+  dat_b %>%
+    group_by(axis) %>%
+    summarise(
+      iter = b,
+      n_ERpos = sum(comparison_group == "ERpos"),
+      n_TNBC = sum(comparison_group == "TNBC"),
+      median_ERpos = median(score[comparison_group == "ERpos"], na.rm = TRUE),
+      median_TNBC = median(score[comparison_group == "TNBC"], na.rm = TRUE),
+      delta_median_TNBC_minus_ERpos = median_TNBC - median_ERpos,
+      cliffs_delta_TNBC_vs_ERpos = cliffs_delta_tnbc_vs_erpos(
+        score[comparison_group == "ERpos"],
+        score[comparison_group == "TNBC"]
+      ),
+      p_value = suppressWarnings(wilcox.test(score ~ comparison_group)$p.value),
+      .groups = "drop"
+    )
+}
+
+downsample_results <- bind_rows(lapply(seq_len(B_down), run_one_downsample)) %>%
+  group_by(iter) %>%
+  mutate(FDR_BH_iter = p.adjust(p_value, method = "BH")) %>%
+  ungroup()
+
+downsample_summary <- downsample_results %>%
+  group_by(axis) %>%
+  summarise(
+    B = n(),
+    median_cliffs_delta = median(cliffs_delta_TNBC_vs_ERpos, na.rm = TRUE),
+    lo95_cliffs_delta = quantile(cliffs_delta_TNBC_vs_ERpos, 0.025, na.rm = TRUE),
+    hi95_cliffs_delta = quantile(cliffs_delta_TNBC_vs_ERpos, 0.975, na.rm = TRUE),
+    median_delta_median = median(delta_median_TNBC_minus_ERpos, na.rm = TRUE),
+    direction_TNBC_higher_freq = mean(cliffs_delta_TNBC_vs_ERpos > 0, na.rm = TRUE),
+    direction_ERpos_higher_freq = mean(cliffs_delta_TNBC_vs_ERpos < 0, na.rm = TRUE),
+    FDR_lt_0.05_freq = mean(FDR_BH_iter < 0.05, na.rm = TRUE),
+    robust_direction = case_when(
+      direction_TNBC_higher_freq >= 0.80 ~ "TNBC_higher_robust",
+      direction_ERpos_higher_freq >= 0.80 ~ "ERpos_higher_robust",
+      TRUE ~ "Direction_unstable"
+    ),
+    robustness_class = case_when(
+      FDR_lt_0.05_freq >= 0.80 &
+        (direction_TNBC_higher_freq >= 0.80 | direction_ERpos_higher_freq >= 0.80) ~ "Strong",
+      FDR_lt_0.05_freq >= 0.50 &
+        (direction_TNBC_higher_freq >= 0.70 | direction_ERpos_higher_freq >= 0.70) ~ "Moderate",
+      TRUE ~ "Weak"
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(median_cliffs_delta)))
+
+p_down <- ggplot(
+  downsample_summary,
+  aes(x = median_cliffs_delta, y = reorder(axis, median_cliffs_delta))
+) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbarh(
+    aes(xmin = lo95_cliffs_delta, xmax = hi95_cliffs_delta),
+    height = 0.18,
+    linewidth = 0.7
+  ) +
+  geom_point(aes(shape = robustness_class), size = 3.2) +
+  labs(
+    title = "Downsampling robustness of ERpos vs TNBC ferroptosis signature",
+    subtitle = paste0("ERpos repeatedly downsampled to TNBC size; B = ", B_down),
+    x = "Median Cliff's delta across downsampling runs",
+    y = NULL,
+    shape = "Robustness"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+readr::write_csv(
+  downsample_results,
+  file.path(paths$tables, "16_downsampling_ERpos_to_TNBC_all_iterations.csv")
+)
+
+readr::write_csv(
+  downsample_summary,
+  file.path(paths$tables, "16_downsampling_ERpos_to_TNBC_summary.csv")
+)
+
+ggsave(
+  file.path(paths$figures, "16_downsampling_ERpos_to_TNBC_robustness.png"),
+  p_down,
+  width = 8,
+  height = 5,
+  dpi = 450,
+  bg = "white"
+)
+
+message("Downsampling robustness completed.")
+print(downsample_summary)
+p_down
+
+```
+
+```{r Chunk 17 — Weighted vs unweighted consistency check}
+# ----------------------------
+# Chunk 17 — Weighted vs unweighted consistency check
+# Purpose:
+#   Confirm that ERpos/TNBC signature is not an artifact of weighted scoring.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(tidyr)
+})
+
+scores_long_all <- readRDS(file.path(paths$processed, "13_scores_long_all.rds"))
+
+focused_both <- scores_long_all %>%
+  filter(
+    cohort == "Focused_ERpos_TNBC",
+    score_type %in% c("weighted_primary", "unweighted_sensitivity"),
+    comparison_group %in% c("ERpos", "TNBC"),
+    is.finite(score)
+  ) %>%
+  mutate(
+    comparison_group = factor(comparison_group, levels = c("ERpos", "TNBC"))
+  )
+
+cliffs_delta_tnbc_vs_erpos <- function(x_er, x_tn) {
+  x_er <- x_er[is.finite(x_er)]
+  x_tn <- x_tn[is.finite(x_tn)]
+  if (length(x_er) < 5 || length(x_tn) < 5) return(NA_real_)
+
+  diff_mat <- outer(x_tn, x_er, FUN = "-")
+  (sum(diff_mat > 0) - sum(diff_mat < 0)) / (length(x_tn) * length(x_er))
+}
+
+consistency_table <- focused_both %>%
+  group_by(score_type, axis) %>%
+  summarise(
+    n_ERpos = sum(comparison_group == "ERpos"),
+    n_TNBC = sum(comparison_group == "TNBC"),
+    median_ERpos = median(score[comparison_group == "ERpos"], na.rm = TRUE),
+    median_TNBC = median(score[comparison_group == "TNBC"], na.rm = TRUE),
+    delta_median_TNBC_minus_ERpos = median_TNBC - median_ERpos,
+    cliffs_delta_TNBC_vs_ERpos = cliffs_delta_tnbc_vs_erpos(
+      score[comparison_group == "ERpos"],
+      score[comparison_group == "TNBC"]
+    ),
+    p_value = suppressWarnings(wilcox.test(score ~ comparison_group)$p.value),
+    .groups = "drop"
+  ) %>%
+  group_by(score_type) %>%
+  mutate(FDR_BH = p.adjust(p_value, method = "BH")) %>%
+  ungroup() %>%
+  mutate(
+    direction = case_when(
+      cliffs_delta_TNBC_vs_ERpos > 0 ~ "TNBC_higher",
+      cliffs_delta_TNBC_vs_ERpos < 0 ~ "ERpos_higher",
+      TRUE ~ "No_shift"
+    )
+  )
+
+consistency_wide <- consistency_table %>%
+  select(score_type, axis, cliffs_delta_TNBC_vs_ERpos, FDR_BH, direction) %>%
+  pivot_wider(
+    names_from = score_type,
+    values_from = c(cliffs_delta_TNBC_vs_ERpos, FDR_BH, direction)
+  ) %>%
+  mutate(
+    same_direction =
+      direction_weighted_primary == direction_unweighted_sensitivity,
+    consistent_signature =
+      same_direction &
+      FDR_BH_weighted_primary < 0.05 &
+      FDR_BH_unweighted_sensitivity < 0.05
+  )
+
+p_consistency <- ggplot(
+  consistency_table,
+  aes(x = axis, y = cliffs_delta_TNBC_vs_ERpos, fill = score_type)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  coord_flip() +
+  labs(
+    title = "Weighted vs unweighted consistency of ERpos/TNBC axis signature",
+    subtitle = "Positive values indicate higher TNBC activity",
+    x = NULL,
+    y = "Cliff's delta (TNBC vs ERpos)",
+    fill = "Score type"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+readr::write_csv(
+  consistency_table,
+  file.path(paths$tables, "17_weighted_unweighted_ERpos_TNBC_signature.csv")
+)
+
+readr::write_csv(
+  consistency_wide,
+  file.path(paths$tables, "17_weighted_unweighted_consistency_summary.csv")
+)
+
+ggsave(
+  file.path(paths$figures, "17_weighted_unweighted_ERpos_TNBC_consistency.png"),
+  p_consistency,
+  width = 8,
+  height = 5,
+  dpi = 450,
+  bg = "white"
+)
+
+message("Weighted/unweighted consistency check completed.")
+print(consistency_wide)
+p_consistency
+
+```
+
+```{r Chunk 18 — ERpos vs TNBC ferroptosis wiring}
+# ----------------------------
+# Chunk 18 — ERpos vs TNBC ferroptosis wiring
+# Pipeline:
+#   Axis score → marker genes → robustness → wiring → validation
+#
+# Purpose:
+#   Test whether ferroptosis axes are coordinated differently in ERpos vs TNBC.
+#   This is the key novelty layer: not only abundance, but regulatory wiring.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+scores_w_focused <- readRDS(
+  file.path(paths$processed, "13_scores_weighted_focused_annotated.rds")
+)
+
+axis_names <- names(readRDS(
+  file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds")
+))
+
+stopifnot(all(axis_names %in% names(scores_w_focused)))
+
+# ----------------------------
+# 18A — Split scores by group
+# ----------------------------
+
+scores_ERpos <- scores_w_focused %>%
+  filter(focused_group_ERpos_TNBC == "ERpos") %>%
+  select(all_of(axis_names))
+
+scores_TNBC <- scores_w_focused %>%
+  filter(focused_group_ERpos_TNBC == "TNBC") %>%
+  select(all_of(axis_names))
+
+message("ERpos samples for wiring: ", nrow(scores_ERpos))
+message("TNBC samples for wiring: ", nrow(scores_TNBC))
+
+stopifnot(nrow(scores_ERpos) > 100)
+stopifnot(nrow(scores_TNBC) > 50)
+
+# ----------------------------
+# 18B — Spearman correlation matrices
+# ----------------------------
+
+cor_ERpos <- cor(scores_ERpos, method = "spearman", use = "pairwise.complete.obs")
+cor_TNBC  <- cor(scores_TNBC,  method = "spearman", use = "pairwise.complete.obs")
+
+cor_diff <- cor_TNBC - cor_ERpos
+
+# ----------------------------
+# 18C — Long edge table
+# ----------------------------
+
+make_edge_table <- function(cor_mat, group_label) {
+  out <- as.data.frame(as.table(cor_mat)) %>%
+    as_tibble() %>%
+    rename(axis_1 = Var1, axis_2 = Var2, rho = Freq) %>%
+    filter(as.character(axis_1) < as.character(axis_2)) %>%
+    mutate(group = group_label)
+
+  out
+}
+
+edges_ERpos <- make_edge_table(cor_ERpos, "ERpos")
+edges_TNBC  <- make_edge_table(cor_TNBC,  "TNBC")
+
+edges_diff <- edges_ERpos %>%
+  select(axis_1, axis_2, rho_ERpos = rho) %>%
+  left_join(
+    edges_TNBC %>% select(axis_1, axis_2, rho_TNBC = rho),
+    by = c("axis_1", "axis_2")
+  ) %>%
+  mutate(
+    delta_rho_TNBC_minus_ERpos = rho_TNBC - rho_ERpos,
+    abs_delta_rho = abs(delta_rho_TNBC_minus_ERpos),
+    edge_class = case_when(
+      abs_delta_rho >= 0.30 ~ "Large rewiring",
+      abs_delta_rho >= 0.20 ~ "Moderate rewiring",
+      abs_delta_rho >= 0.10 ~ "Small rewiring",
+      TRUE ~ "Minimal"
+    )
+  ) %>%
+  arrange(desc(abs_delta_rho))
+
+# ----------------------------
+# 18D — Heatmap plotting function
+# ----------------------------
+
+plot_cor_heatmap <- function(cor_mat, title, fill_title = "Spearman\nrho") {
+
+  df <- as.data.frame(as.table(cor_mat)) %>%
+    as_tibble() %>%
+    rename(axis_1 = Var1, axis_2 = Var2, value = Freq) %>%
+    mutate(
+      axis_1 = factor(axis_1, levels = axis_names),
+      axis_2 = factor(axis_2, levels = rev(axis_names))
+    )
+
+  ggplot(df, aes(x = axis_1, y = axis_2, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+    scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "white",
+      high = "#B2182B",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = fill_title
+    ) +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+plot_diff_heatmap <- function(diff_mat) {
+
+  max_abs <- max(abs(diff_mat), na.rm = TRUE)
+
+  df <- as.data.frame(as.table(diff_mat)) %>%
+    as_tibble() %>%
+    rename(axis_1 = Var1, axis_2 = Var2, value = Freq) %>%
+    mutate(
+      axis_1 = factor(axis_1, levels = axis_names),
+      axis_2 = factor(axis_2, levels = rev(axis_names))
+    )
+
+  ggplot(df, aes(x = axis_1, y = axis_2, fill = value)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(aes(label = sprintf("%.2f", value)), size = 3) +
+    scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "white",
+      high = "#B2182B",
+      midpoint = 0,
+      limits = c(-max_abs, max_abs),
+      name = "Delta rho\nTNBC-ERpos"
+    ) +
+    labs(
+      title = "Differential ferroptosis wiring",
+      subtitle = "Positive values indicate stronger axis coupling in TNBC",
+      x = NULL,
+      y = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+p_cor_ERpos <- plot_cor_heatmap(cor_ERpos, "ERpos ferroptosis wiring")
+p_cor_TNBC  <- plot_cor_heatmap(cor_TNBC,  "TNBC ferroptosis wiring")
+p_cor_diff  <- plot_diff_heatmap(cor_diff)
+
+# ----------------------------
+# 18E — Save outputs
+# ----------------------------
+
+saveRDS(cor_ERpos, file.path(paths$processed, "18_cor_axis_wiring_ERpos.rds"))
+saveRDS(cor_TNBC,  file.path(paths$processed, "18_cor_axis_wiring_TNBC.rds"))
+saveRDS(cor_diff,  file.path(paths$processed, "18_cor_axis_wiring_diff_TNBC_minus_ERpos.rds"))
+
+readr::write_csv(edges_ERpos, file.path(paths$tables, "18_edges_axis_wiring_ERpos.csv"))
+readr::write_csv(edges_TNBC,  file.path(paths$tables, "18_edges_axis_wiring_TNBC.csv"))
+readr::write_csv(edges_diff,  file.path(paths$tables, "18_edges_differential_wiring_TNBC_minus_ERpos.csv"))
+
+ggsave(
+  file.path(paths$figures, "18_axis_wiring_ERpos_heatmap.png"),
+  p_cor_ERpos,
+  width = 7,
+  height = 6,
+  dpi = 450,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "18_axis_wiring_TNBC_heatmap.png"),
+  p_cor_TNBC,
+  width = 7,
+  height = 6,
+  dpi = 450,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "18_axis_wiring_diff_TNBC_minus_ERpos_heatmap.png"),
+  p_cor_diff,
+  width = 7,
+  height = 6,
+  dpi = 450,
+  bg = "white"
+)
+
+message("Ferroptosis wiring completed.")
+message("Top differential wiring edges:")
+print(head(edges_diff, 10))
+
+p_cor_ERpos
+p_cor_TNBC
+p_cor_diff
+
+```
+
+```{r Chunk 19 — Permutation test for differential ferroptosis wiring}
+# ----------------------------
+# Chunk 19 — Permutation test for differential ferroptosis wiring
+# Pipeline:
+#   Axis score → marker genes → robustness → wiring → validation
+#
+# Purpose:
+#   Test whether ERpos vs TNBC wiring differences are larger than expected by chance.
+#
+# Null hypothesis:
+#   Group labels are exchangeable; observed TNBC-ERpos delta rho is random.
+#
+# Output:
+#   - observed edge-level delta rho
+#   - empirical permutation p value
+#   - BH-FDR
+#   - clean significant-edge table
+#   - volcano-style rewiring plot
+#   - significant differential-wiring heatmap
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+})
+
+set.seed(SPEC$seed)
+
+# ----------------------------
+# 19A — Load focused weighted scores
+# ----------------------------
+
+scores_w_focused <- readRDS(
+  file.path(paths$processed, "13_scores_weighted_focused_annotated.rds")
+)
+
+axis_names <- names(readRDS(
+  file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds")
+))
+
+B_perm <- SPEC$B_perm
+
+wiring_df <- scores_w_focused %>%
+  filter(focused_group_ERpos_TNBC %in% c("ERpos", "TNBC")) %>%
+  dplyr::select(sample_id, focused_group_ERpos_TNBC, all_of(axis_names)) %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+stopifnot(all(axis_names %in% names(wiring_df)))
+stopifnot(all(c("ERpos", "TNBC") %in% wiring_df$focused_group_ERpos_TNBC))
+
+n_ERpos <- sum(wiring_df$focused_group_ERpos_TNBC == "ERpos")
+n_TNBC  <- sum(wiring_df$focused_group_ERpos_TNBC == "TNBC")
+
+message("Permutation wiring test:")
+message("ERpos n = ", n_ERpos)
+message("TNBC n  = ", n_TNBC)
+message("B_perm  = ", B_perm)
+
+# ----------------------------
+# 19B — Helper functions
+# ----------------------------
+
+get_delta_edges <- function(dat, group_col = "focused_group_ERpos_TNBC") {
+
+  mat_ER <- dat %>%
+    filter(.data[[group_col]] == "ERpos") %>%
+    dplyr::select(all_of(axis_names))
+
+  mat_TN <- dat %>%
+    filter(.data[[group_col]] == "TNBC") %>%
+    dplyr::select(all_of(axis_names))
+
+  cor_ER <- cor(mat_ER, method = "spearman", use = "pairwise.complete.obs")
+  cor_TN <- cor(mat_TN, method = "spearman", use = "pairwise.complete.obs")
+
+  out <- expand.grid(
+    axis_1 = axis_names,
+    axis_2 = axis_names,
+    stringsAsFactors = FALSE
+  ) %>%
+    as_tibble() %>%
+    filter(axis_1 < axis_2) %>%
+    rowwise() %>%
+    mutate(
+      rho_ERpos = cor_ER[axis_1, axis_2],
+      rho_TNBC  = cor_TN[axis_1, axis_2],
+      delta_rho_TNBC_minus_ERpos = rho_TNBC - rho_ERpos
+    ) %>%
+    ungroup()
+
+  out
+}
+
+observed_edges <- get_delta_edges(wiring_df)
+
+# ----------------------------
+# 19C — Permutation loop
+# ----------------------------
+
+perm_delta_mat <- matrix(
+  NA_real_,
+  nrow = nrow(observed_edges),
+  ncol = B_perm
+)
+
+rownames(perm_delta_mat) <- paste(observed_edges$axis_1, observed_edges$axis_2, sep = "__")
+
+for (b in seq_len(B_perm)) {
+
+  dat_perm <- wiring_df
+  dat_perm$perm_group <- sample(dat_perm$focused_group_ERpos_TNBC)
+
+  perm_edges <- get_delta_edges(dat_perm, group_col = "perm_group")
+
+  perm_delta_mat[, b] <- perm_edges$delta_rho_TNBC_minus_ERpos
+
+  if (b %% 100 == 0) {
+    message("Completed permutation ", b, " / ", B_perm)
+  }
+}
+
+# ----------------------------
+# 19D — Empirical two-sided p values + FDR
+# ----------------------------
+
+perm_p <- vapply(seq_len(nrow(observed_edges)), function(i) {
+
+  obs <- abs(observed_edges$delta_rho_TNBC_minus_ERpos[i])
+  null <- abs(perm_delta_mat[i, ])
+
+  # +1 correction avoids p = 0
+  (sum(null >= obs, na.rm = TRUE) + 1) / (sum(is.finite(null)) + 1)
+
+}, numeric(1))
+
+perm_summary <- observed_edges %>%
+  mutate(
+    p_perm = perm_p,
+    FDR_BH = p.adjust(p_perm, method = "BH"),
+    abs_delta_rho = abs(delta_rho_TNBC_minus_ERpos),
+    direction = case_when(
+      delta_rho_TNBC_minus_ERpos > 0 ~ "Stronger in TNBC",
+      delta_rho_TNBC_minus_ERpos < 0 ~ "Stronger in ERpos",
+      TRUE ~ "No difference"
+    ),
+    evidence_class = case_when(
+      FDR_BH < 0.05 & abs_delta_rho >= 0.30 ~ "Strong rewiring",
+      FDR_BH < 0.05 & abs_delta_rho >= 0.20 ~ "Moderate rewiring",
+      FDR_BH < 0.10 & abs_delta_rho >= 0.20 ~ "Nominal rewiring",
+      TRUE ~ "Not significant"
+    )
+  ) %>%
+  arrange(FDR_BH, desc(abs_delta_rho))
+
+sig_edges <- perm_summary %>%
+  filter(FDR_BH < 0.05) %>%
+  arrange(desc(abs_delta_rho))
+
+# ----------------------------
+# 19E — Plot 1: differential-wiring volcano
+# ----------------------------
+
+p_volcano <- ggplot(
+  perm_summary,
+  aes(
+    x = delta_rho_TNBC_minus_ERpos,
+    y = -log10(p_perm),
+    label = paste(axis_1, axis_2, sep = "–")
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted", linewidth = 0.5) +
+  geom_point(aes(shape = evidence_class), size = 3, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    data = perm_summary %>%
+      filter(FDR_BH < 0.10 | abs_delta_rho >= 0.30),
+    size = 3,
+    max.overlaps = 30
+  ) +
+  labs(
+    title = "Permutation-tested differential ferroptosis wiring",
+    subtitle = paste0("Empirical two-sided permutation test; B = ", B_perm),
+    x = expression(Delta*rho~"(TNBC - ERpos)"),
+    y = expression(-log[10]~"(permutation p value)"),
+    shape = "Evidence"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# ----------------------------
+# 19F — Plot 2: FDR-filtered differential-wiring heatmap
+# ----------------------------
+
+sig_mat <- matrix(
+  NA_real_,
+  nrow = length(axis_names),
+  ncol = length(axis_names),
+  dimnames = list(axis_names, axis_names)
+)
+
+for (i in seq_len(nrow(perm_summary))) {
+  a1 <- perm_summary$axis_1[i]
+  a2 <- perm_summary$axis_2[i]
+
+  if (perm_summary$FDR_BH[i] < 0.05) {
+    sig_mat[a1, a2] <- perm_summary$delta_rho_TNBC_minus_ERpos[i]
+    sig_mat[a2, a1] <- perm_summary$delta_rho_TNBC_minus_ERpos[i]
+  }
+}
+
+diag(sig_mat) <- 0
+
+max_abs_sig <- max(abs(sig_mat), na.rm = TRUE)
+if (!is.finite(max_abs_sig) || max_abs_sig == 0) max_abs_sig <- 0.5
+
+sig_heat_df <- as.data.frame(as.table(sig_mat)) %>%
+  as_tibble() %>%
+  rename(axis_1 = Var1, axis_2 = Var2, delta_rho = Freq) %>%
+  mutate(
+    axis_1 = factor(axis_1, levels = axis_names),
+    axis_2 = factor(axis_2, levels = rev(axis_names)),
+    label = ifelse(is.na(delta_rho), "", sprintf("%.2f", delta_rho))
+  )
+
+p_sig_heat <- ggplot(sig_heat_df, aes(x = axis_1, y = axis_2, fill = delta_rho)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = label), size = 3.2) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-max_abs_sig, max_abs_sig),
+    na.value = "grey92",
+    name = "Significant\nDelta rho"
+  ) +
+  labs(
+    title = "FDR-significant differential ferroptosis wiring",
+    subtitle = "Only edges with BH-FDR < 0.05 are shown",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+# ----------------------------
+# 19G — Save outputs
+# ----------------------------
+
+saveRDS(
+  perm_delta_mat,
+  file.path(paths$processed, "19_permutation_null_delta_rho_matrix.rds")
+)
+
+saveRDS(
+  perm_summary,
+  file.path(paths$processed, "19_permutation_differential_wiring_summary.rds")
+)
+
+readr::write_csv(
+  perm_summary,
+  file.path(paths$tables, "19_permutation_differential_wiring_all_edges.csv")
+)
+
+readr::write_csv(
+  sig_edges,
+  file.path(paths$tables, "19_permutation_differential_wiring_FDR_significant_edges.csv")
+)
+
+ggsave(
+  file.path(paths$figures, "19_permutation_differential_wiring_volcano.png"),
+  p_volcano,
+  width = 8,
+  height = 5.5,
+  dpi = 450,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "19_permutation_differential_wiring_FDR_heatmap.png"),
+  p_sig_heat,
+  width = 7,
+  height = 6,
+  dpi = 450,
+  bg = "white"
+)
+
+writeLines(
+  c(
+    "Chunk 19 permutation differential wiring test",
+    "",
+    paste0("ERpos n = ", n_ERpos),
+    paste0("TNBC n = ", n_TNBC),
+    paste0("Permutation iterations = ", B_perm),
+    "",
+    "Test:",
+    "For each ferroptosis axis pair, group labels were permuted and the TNBC-minus-ERpos Spearman correlation difference was recomputed.",
+    "Empirical two-sided p values were calculated from the null distribution of absolute delta rho.",
+    "BH-FDR was applied across all tested axis pairs.",
+    "",
+    "Interpretation:",
+    "Significant positive delta rho indicates stronger axis coupling in TNBC.",
+    "Significant negative delta rho indicates stronger axis coupling in ERpos."
+  ),
+  con = file.path(paths$tables, "19_permutation_differential_wiring_note.txt")
+)
+
+message("Permutation differential wiring test completed.")
+message("Significant edges at FDR < 0.05: ", nrow(sig_edges))
+print(sig_edges)
+
+p_volcano
+p_sig_heat
+```
+The BIG biological conclusion 
+
+we can now state:
+
+ ERpos tumors:
+
+Maintain a modular, buffered ferroptosis defense network, where antioxidant pathways are strongly interconnected but largely insulated from lipid and iron metabolism.
+
+TNBC tumors:
+
+Exhibit a rewired ferroptosis network, where antioxidant systems (GPX4, FSP1, BH4, DHODH) are directly coupled to ferroptosis-driving processes (PUFA loading, iron handling), forming a tightly integrated but potentially vulnerable state.
+
+```{r Chunk 20 — ERpos vs TNBC wiring network visualization}
+# ----------------------------
+# Chunk 20 — ERpos vs TNBC wiring network visualization
+# Purpose:
+#   Draw clean R/igraph network plots for ERpos and TNBC ferroptosis wiring.
+#   Fixes:
+#     - no truncated labels
+#     - larger circular layout
+#     - cleaner legends
+#     - white background
+#     - publication-ready PNGs
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(igraph)
+  library(ggraph)
+  library(ggrepel)
+  library(patchwork)
+})
+
+if (!requireNamespace("ggraph", quietly = TRUE)) {
+  install.packages("ggraph")
+  library(ggraph)
+}
+
+axis_names <- names(readRDS(file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds")))
+
+cor_ERpos <- readRDS(file.path(paths$processed, "18_cor_axis_wiring_ERpos.rds"))
+cor_TNBC  <- readRDS(file.path(paths$processed, "18_cor_axis_wiring_TNBC.rds"))
+
+sig_edges <- readr::read_csv(
+  file.path(paths$tables, "19_permutation_differential_wiring_FDR_significant_edges.csv"),
+  show_col_types = FALSE
+)
+
+# ----------------------------
+# 20A — Labels and node classes
+# ----------------------------
+
+label_map <- c(
+  "Xc_GSH" = "Xc/GSH",
+  "GPX4_Selenium" = "GPX4/Se",
+  "FSP1_CoQ" = "FSP1/CoQ",
+  "BH4_GCH1" = "BH4/GCH1",
+  "DHODH_Mito" = "DHODH",
+  "Iron_Handling" = "Iron",
+  "PUFA_Loading" = "PUFA",
+  "Lipid_Peroxidation" = "Lipid\nperox."
+)
+
+node_tbl <- tibble::tibble(
+  name = axis_names,
+  label = dplyr::recode(name, !!!label_map),
+  axis_class = case_when(
+    name %in% c("Xc_GSH", "GPX4_Selenium", "FSP1_CoQ", "BH4_GCH1", "DHODH_Mito") ~ "Defense",
+    name %in% c("Iron_Handling", "PUFA_Loading", "Lipid_Peroxidation") ~ "Susceptibility",
+    TRUE ~ "Other"
+  )
+)
+
+# ----------------------------
+# 20B — Convert correlation matrix to edge table
+# ----------------------------
+
+make_network_edges <- function(cor_mat, group_label, thr = 0.25) {
+
+  as.data.frame(as.table(cor_mat)) %>%
+    tibble::as_tibble() %>%
+    rename(from = Var1, to = Var2, rho = Freq) %>%
+    mutate(
+      from = as.character(from),
+      to = as.character(to)
+    ) %>%
+    filter(from < to) %>%
+    mutate(
+      abs_rho = abs(rho),
+      sign = ifelse(rho >= 0, "Positive", "Negative"),
+      group = group_label
+    ) %>%
+    filter(abs_rho >= thr)
+}
+
+NETWORK_THR <- SPEC$thr_abs_r
+
+edges_ERpos <- make_network_edges(cor_ERpos, "ERpos", thr = NETWORK_THR)
+edges_TNBC  <- make_network_edges(cor_TNBC,  "TNBC",  thr = NETWORK_THR)
+
+# ----------------------------
+# 20C — Fixed larger circular layout
+# ----------------------------
+
+theta <- seq(0, 2 * pi, length.out = length(axis_names) + 1)[-1]
+
+layout_tbl <- tibble::tibble(
+  name = axis_names,
+  x = 1.45 * cos(theta),
+  y = 1.45 * sin(theta)
+)
+
+# ----------------------------
+# 20D — Plot function
+# ----------------------------
+
+plot_axis_network <- function(edge_tbl, title_text, subtitle_text) {
+
+  graph_obj <- igraph::graph_from_data_frame(
+    d = edge_tbl,
+    vertices = node_tbl,
+    directed = FALSE
+  )
+
+  layout_use <- layout_tbl %>%
+    filter(name %in% igraph::V(graph_obj)$name) %>%
+    arrange(match(name, igraph::V(graph_obj)$name)) %>%
+    select(x, y) %>%
+    as.matrix()
+
+  ggraph(graph_obj, layout = "manual", x = layout_use[, 1], y = layout_use[, 2]) +
+    geom_edge_link(
+      aes(width = abs_rho, color = sign),
+      alpha = 0.78,
+      lineend = "round"
+    ) +
+    geom_node_point(
+      aes(fill = axis_class),
+      shape = 21,
+      size = 6.8,
+      color = "black",
+      stroke = 0.45
+    ) +
+    geom_node_text(
+      aes(label = label),
+      repel = TRUE,
+      size = 4.2,
+      fontface = "bold",
+      box.padding = 0.65,
+      point.padding = 0.45,
+      max.overlaps = Inf
+    ) +
+    scale_edge_width(
+      range = c(0.45, 3.4),
+      name = "|Spearman rho|"
+    ) +
+    scale_edge_color_manual(
+      values = c("Positive" = "#B2182B", "Negative" = "#2166AC"),
+      name = "Correlation"
+    ) +
+    scale_fill_manual(
+      values = c("Defense" = "#8DD3C7", "Susceptibility" = "#FDB462", "Other" = "grey80"),
+      name = "Axis class"
+    ) +
+    coord_cartesian(clip = "off") +
+    labs(
+      title = title_text,
+      subtitle = subtitle_text
+    ) +
+    theme_void(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      legend.position = "bottom",
+      legend.box = "vertical",
+      plot.margin = margin(25, 55, 25, 55)
+    )
+}
+
+p_net_ERpos <- plot_axis_network(
+  edges_ERpos,
+  title_text = "ERpos ferroptosis wiring",
+  subtitle_text = paste0("Edges shown if |rho| ≥ ", NETWORK_THR)
+)
+
+p_net_TNBC <- plot_axis_network(
+  edges_TNBC,
+  title_text = "TNBC ferroptosis wiring",
+  subtitle_text = paste0("Edges shown if |rho| ≥ ", NETWORK_THR)
+)
+
+p_network_compare <- p_net_ERpos + p_net_TNBC +
+  plot_annotation(
+    title = "Ferroptosis axis wiring differs between ERpos and TNBC",
+    subtitle = "TNBC shows stronger coupling of defense axes with PUFA loading and iron handling",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 18),
+      plot.subtitle = element_text(size = 13),
+      plot.margin = margin(15, 20, 15, 20)
+    )
+  )
+
+# ----------------------------
+# 20E — Differential FDR-significant network
+# ----------------------------
+
+edges_diff_sig <- sig_edges %>%
+  transmute(
+    from = axis_1,
+    to = axis_2,
+    delta_rho = delta_rho_TNBC_minus_ERpos,
+    abs_delta = abs(delta_rho),
+    sign = ifelse(delta_rho >= 0, "Stronger in TNBC", "Stronger in ERpos")
+  )
+
+graph_diff <- igraph::graph_from_data_frame(
+  d = edges_diff_sig,
+  vertices = node_tbl,
+  directed = FALSE
+)
+
+layout_diff <- layout_tbl %>%
+  filter(name %in% igraph::V(graph_diff)$name) %>%
+  arrange(match(name, igraph::V(graph_diff)$name)) %>%
+  select(x, y) %>%
+  as.matrix()
+
+p_diff_network <- ggraph(graph_diff, layout = "manual", x = layout_diff[, 1], y = layout_diff[, 2]) +
+  geom_edge_link(
+    aes(width = abs_delta, color = sign),
+    alpha = 0.88,
+    lineend = "round"
+  ) +
+  geom_node_point(
+    aes(fill = axis_class),
+    shape = 21,
+    size = 7.2,
+    color = "black",
+    stroke = 0.45
+  ) +
+  geom_node_text(
+    aes(label = label),
+    repel = TRUE,
+    size = 4.3,
+    fontface = "bold",
+    box.padding = 0.7,
+    point.padding = 0.5,
+    max.overlaps = Inf
+  ) +
+  scale_edge_width(
+    range = c(0.8, 4.2),
+    name = "|Delta rho|"
+  ) +
+  scale_edge_color_manual(
+    values = c("Stronger in TNBC" = "#B2182B", "Stronger in ERpos" = "#2166AC"),
+    name = "Differential wiring"
+  ) +
+  scale_fill_manual(
+    values = c("Defense" = "#8DD3C7", "Susceptibility" = "#FDB462", "Other" = "grey80"),
+    name = "Axis class"
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title = "FDR-significant differential ferroptosis wiring",
+    subtitle = "Edges are BH-FDR < 0.05 from permutation testing"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    plot.margin = margin(30, 65, 30, 65)
+  )
+
+# ----------------------------
+# 20F — Save outputs
+# ----------------------------
+
+readr::write_csv(edges_ERpos, file.path(paths$tables, "20_network_edges_ERpos_absrho_filtered.csv"))
+readr::write_csv(edges_TNBC,  file.path(paths$tables, "20_network_edges_TNBC_absrho_filtered.csv"))
+readr::write_csv(edges_diff_sig, file.path(paths$tables, "20_network_edges_differential_FDR_significant.csv"))
+
+ggsave(
+  file.path(paths$figures, "20_network_ERpos_vs_TNBC_side_by_side.png"),
+  p_network_compare,
+  width = 17,
+  height = 8.5,
+  dpi = 450,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "20_network_differential_FDR_significant.png"),
+  p_diff_network,
+  width = 9,
+  height = 8,
+  dpi = 450,
+  bg = "white"
+)
+
+message("Network visualization completed.")
+message("Saved:")
+message("- 20_network_ERpos_vs_TNBC_side_by_side.png")
+message("- 20_network_differential_FDR_significant.png")
+
+# ----------------------------
+# 20G — Safe inline display with fallback
+# ----------------------------
+
+# Always save to file first (already done above).
+# Attempt inline render with graceful fallback to individual plots.
+
+safe_print_patchwork <- function(combined_plot, fallback_list, label) {
+  tryCatch(
+    {
+      print(combined_plot)
+    },
+    error = function(e) {
+      message(
+        label,
+        ": patchwork render failed (Plots pane may be too small). ",
+        "Showing individual plots instead. See saved PNG for the combined version."
+      )
+      for (p in fallback_list) {
+        tryCatch(print(p), error = function(e2) message("Individual plot also failed to render inline."))
+      }
+    }
+  )
+}
+
+safe_print_patchwork(
+  combined_plot  = p_network_compare,
+  fallback_list  = list(p_net_ERpos, p_net_TNBC),
+  label          = "Network side-by-side"
+)
+
+# Differential network is a single plot — safe to print directly
+tryCatch(
+  print(p_diff_network),
+  error = function(e) {
+    message("p_diff_network render failed inline. See saved PNG.")
+  }
+)
+```
+TNBC exhibits a ferroptosis-prone but compensatory state, where increased lipid and iron-driven stress is counterbalanced by tightly coupled antioxidant defenses, creating a condition of heightened dependency on these protective pathways.
+Although TNBC tumors maintain active antioxidant defenses, their increased coupling to lipid peroxidation and iron-handling pathways suggests a state of elevated ferroptotic stress that is actively compensated, resulting in heightened dependency on these protective mechanisms.
+
+so we claim TNBC is resistant or sensitive?
+Both, depending on context: resistant at baseline, but more vulnerable when defense systems are disrupted.
+
+his leads to:
+
+Therapeutic implication:
+
+Target GPX4 / FSP1 / system Xc⁻
+→ TNBC selectively dies
+```{r Chunk 21 — Automated unbiased validation marker selection}
+# ----------------------------
+# Chunk 21 — Automated unbiased validation marker selection
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+})
+
+# Force dplyr::select to win over any masked versions (e.g., from MASS via effectsize)
+select <- dplyr::select
+
+# ----------------------------
+# 21A — Load inputs
+# ----------------------------
+
+expr_z <- readRDS(file.path(paths$processed, "11_expr_z_focused_ERpos_TNBC_repSAFE.rds"))
+clin   <- readRDS(file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+axis_gene_table <- readr::read_csv(
+  file.path(paths$tables, "10_CORE_ferroptosis_axis_gene_membership.csv"),
+  show_col_types = FALSE
+)
+
+axis_signature <- readr::read_csv(
+  file.path(paths$tables, "15_ERpos_TNBC_weighted_axis_signature.csv"),
+  show_col_types = FALSE
+)
+
+downsample_summary <- readr::read_csv(
+  file.path(paths$tables, "16_downsampling_ERpos_to_TNBC_summary.csv"),
+  show_col_types = FALSE
+)
+
+consistency_summary <- readr::read_csv(
+  file.path(paths$tables, "17_weighted_unweighted_consistency_summary.csv"),
+  show_col_types = FALSE
+)
+
+diff_wiring <- readr::read_csv(
+  file.path(paths$tables, "19_permutation_differential_wiring_all_edges.csv"),
+  show_col_types = FALSE
+)
+
+stopifnot(all(colnames(expr_z) == clin$sample_id))
+
+# ----------------------------
+# 21B — Manual Cliff's delta
+# ----------------------------
+
+cliffs_delta_tnbc_vs_erpos <- function(x_er, x_tn) {
+  x_er <- x_er[is.finite(x_er)]
+  x_tn <- x_tn[is.finite(x_tn)]
+  if (length(x_er) < 5 || length(x_tn) < 5) return(NA_real_)
+  diff_mat <- outer(x_tn, x_er, FUN = "-")
+  (sum(diff_mat > 0) - sum(diff_mat < 0)) / (length(x_tn) * length(x_er))
+}
+
+# ----------------------------
+# 21C — Axis-level evidence score
+# ----------------------------
+
+axis_evidence <- axis_signature %>%
+  dplyr::select(
+    axis,
+    axis_FDR_BH        = FDR_BH,
+    axis_cliffs_delta  = cliffs_delta_TNBC_vs_ERpos,
+    axis_direction     = direction,
+    signature_support
+  ) %>%
+  left_join(
+    downsample_summary %>%
+      dplyr::select(
+        axis,
+        robustness_class,
+        FDR_lt_0.05_freq,
+        direction_TNBC_higher_freq,
+        direction_ERpos_higher_freq
+      ),
+    by = "axis"
+  ) %>%
+  left_join(
+    consistency_summary %>%
+      dplyr::select(axis, same_direction, consistent_signature),
+    by = "axis"
+  ) %>%
+  mutate(
+    axis_difference_points = case_when(
+      axis_FDR_BH < 0.05 & abs(axis_cliffs_delta) >= 0.20 ~ 2,
+      axis_FDR_BH < 0.05 & abs(axis_cliffs_delta) >= 0.10 ~ 1,
+      TRUE ~ 0
+    ),
+    axis_robustness_points = case_when(
+      robustness_class == "Strong"   ~ 2,
+      robustness_class == "Moderate" ~ 1,
+      TRUE ~ 0
+    ),
+    axis_consistency_points = case_when(
+      same_direction == TRUE ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+# ----------------------------
+# 21D — Wiring support per axis
+# ----------------------------
+
+wiring_axis_support <- diff_wiring %>%
+  filter(FDR_BH < 0.05) %>%
+  dplyr::select(axis_1, axis_2, delta_rho_TNBC_minus_ERpos, FDR_BH) %>%
+  pivot_longer(
+    cols      = c(axis_1, axis_2),
+    names_to  = "axis_position",
+    values_to = "axis"
+  ) %>%
+  group_by(axis) %>%
+  summarise(
+    n_FDR_significant_wiring_edges = n(),
+    max_abs_delta_rho = max(abs(delta_rho_TNBC_minus_ERpos), na.rm = TRUE),
+    wiring_points = case_when(
+      n_FDR_significant_wiring_edges >= 3 ~ 2,
+      n_FDR_significant_wiring_edges >= 1 ~ 1,
+      TRUE ~ 0
+    ),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 21E — Gene-level expression statistics for core genes PRESENT in expr_z
+# ----------------------------
+
+core_genes <- axis_gene_table %>%
+  distinct(axis, gene) %>%
+  filter(gene %in% rownames(expr_z))
+
+message("Core genes defined: ", nrow(axis_gene_table %>% distinct(gene)))
+message("Core genes present in expr_z: ", nrow(core_genes))
+
+if (nrow(core_genes) == 0) {
+  stop(
+    "Zero core ferroptosis genes found in expr_z. ",
+    "The expression matrix is likely truncated (check Chunk 03 fread fill=TRUE). ",
+    "Available rownames sample: ",
+    paste(head(rownames(expr_z), 10), collapse = ", ")
+  )
+}
+
+expr_core <- expr_z[core_genes$gene, , drop = FALSE]
+
+gene_df         <- as.data.frame(t(expr_core))
+gene_df$sample_id <- rownames(gene_df)
+
+gene_df <- gene_df %>%
+  left_join(
+    clin %>% dplyr::select(sample_id, focused_group_ERpos_TNBC),
+    by = "sample_id"
+  ) %>%
+  filter(focused_group_ERpos_TNBC %in% c("ERpos", "TNBC")) %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+gene_long <- gene_df %>%
+  pivot_longer(
+    cols      = all_of(core_genes$gene),
+    names_to  = "gene",
+    values_to = "z_expression"
+  ) %>%
+  filter(is.finite(z_expression))
+
+gene_stats <- gene_long %>%
+  group_by(gene) %>%
+  summarise(
+    n_ERpos  = sum(focused_group_ERpos_TNBC == "ERpos"),
+    n_TNBC   = sum(focused_group_ERpos_TNBC == "TNBC"),
+    median_ERpos = median(z_expression[focused_group_ERpos_TNBC == "ERpos"], na.rm = TRUE),
+    median_TNBC  = median(z_expression[focused_group_ERpos_TNBC == "TNBC"], na.rm = TRUE),
+    delta_median_TNBC_minus_ERpos      = median_TNBC - median_ERpos,
+    gene_cliffs_delta_TNBC_vs_ERpos    = cliffs_delta_tnbc_vs_erpos(
+      z_expression[focused_group_ERpos_TNBC == "ERpos"],
+      z_expression[focused_group_ERpos_TNBC == "TNBC"]
+    ),
+    gene_p_value = suppressWarnings(
+      wilcox.test(z_expression ~ focused_group_ERpos_TNBC)$p.value
+    ),
+    pct_finite = mean(is.finite(z_expression)) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    gene_FDR_BH = p.adjust(gene_p_value, method = "BH"),
+    gene_direction = case_when(
+      gene_cliffs_delta_TNBC_vs_ERpos > 0 ~ "TNBC higher",
+      gene_cliffs_delta_TNBC_vs_ERpos < 0 ~ "ERpos higher",
+      TRUE ~ "No shift"
+    ),
+    gene_expression_points = case_when(
+      gene_FDR_BH < 0.05 & abs(gene_cliffs_delta_TNBC_vs_ERpos) >= 0.30 ~ 3,
+      gene_FDR_BH < 0.05 & abs(gene_cliffs_delta_TNBC_vs_ERpos) >= 0.20 ~ 2,
+      gene_FDR_BH < 0.05 & abs(gene_cliffs_delta_TNBC_vs_ERpos) >= 0.10 ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+# ----------------------------
+# 21F — Automated marker ranking
+# ----------------------------
+
+marker_ranking <- core_genes %>%
+  left_join(axis_evidence,       by = "axis") %>%
+  left_join(wiring_axis_support, by = "axis") %>%
+  left_join(gene_stats,          by = "gene") %>%
+  mutate(
+    n_FDR_significant_wiring_edges = replace_na(n_FDR_significant_wiring_edges, 0),
+    max_abs_delta_rho              = replace_na(max_abs_delta_rho, 0),
+    wiring_points                  = replace_na(wiring_points, 0),
+    detectability_points = case_when(pct_finite >= 95 ~ 1, TRUE ~ 0),
+    total_marker_score =
+      axis_difference_points +
+      axis_robustness_points +
+      axis_consistency_points +
+      wiring_points +
+      gene_expression_points +
+      detectability_points,
+    selection_reason = paste0(
+      "Axis=", axis,
+      "; axis_delta=", round(axis_cliffs_delta, 2),
+      "; gene_delta=", round(gene_cliffs_delta_TNBC_vs_ERpos, 2),
+      "; wiring_edges=", n_FDR_significant_wiring_edges
+    )
+  ) %>%
+  arrange(desc(total_marker_score), gene_FDR_BH, desc(abs(gene_cliffs_delta_TNBC_vs_ERpos)))
+
+# ----------------------------
+# 21G — Choose final unbiased validation panel
+# ----------------------------
+
+eligible_axes <- axis_evidence %>%
+  left_join(wiring_axis_support, by = "axis") %>%
+  mutate(
+    n_FDR_significant_wiring_edges = replace_na(n_FDR_significant_wiring_edges, 0),
+    axis_total_support =
+      axis_difference_points +
+      axis_robustness_points +
+      axis_consistency_points +
+      replace_na(wiring_points, 0)
+  ) %>%
+  filter(axis_total_support >= 3) %>%
+  arrange(desc(axis_total_support), axis_FDR_BH)
+
+selected_panel <- marker_ranking %>%
+  semi_join(eligible_axes, by = "axis") %>%
+  group_by(axis) %>%
+  slice_max(order_by = total_marker_score, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(total_marker_score)) %>%
+  slice_head(n = 5) %>%
+  mutate(
+    selected_for_validation = TRUE,
+    validation_tier = case_when(
+      row_number() <= 4 ~ "Minimal pilot panel",
+      TRUE              ~ "Optional fifth marker"
+    )
+  )
+
+# If eligible_axes filter is too strict and leaves no markers, fall back
+if (nrow(selected_panel) == 0) {
+  warning(
+    "No markers passed eligible_axes filter (axis_total_support >= 3). ",
+    "Falling back to top 5 markers from overall ranking."
+  )
+  selected_panel <- marker_ranking %>%
+    slice_head(n = 5) %>%
+    mutate(
+      selected_for_validation = TRUE,
+      validation_tier = case_when(
+        row_number() <= 4 ~ "Minimal pilot panel",
+        TRUE              ~ "Optional fifth marker"
+      )
+    )
+}
+
+message("Selected panel (", nrow(selected_panel), " markers):")
+message("All selected genes present in expr_z: ",
+        all(selected_panel$gene %in% rownames(expr_z)))
+
+# ----------------------------
+# 21H — Visualization
+# ----------------------------
+
+n_plot <- min(20, nrow(marker_ranking))
+
+p_marker_rank <- marker_ranking %>%
+  mutate(
+    gene_axis = paste0(gene, " / ", axis),
+    selected  = gene %in% selected_panel$gene
+  ) %>%
+  slice_max(order_by = total_marker_score, n = n_plot) %>%
+  ggplot(aes(x = reorder(gene_axis, total_marker_score), y = total_marker_score)) +
+  geom_col(aes(fill = selected), width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("FALSE" = "grey75", "TRUE" = "#B2182B")) +
+  labs(
+    title    = "Automated ranking of candidate validation markers",
+    subtitle = "Markers ranked by axis robustness, wiring support, and gene-level subtype evidence",
+    x    = NULL,
+    y    = "Automated marker score",
+    fill = "Selected"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# ----------------------------
+# 21I — Save outputs
+# ----------------------------
+
+readr::write_csv(
+  marker_ranking,
+  file.path(paths$tables, "21_unbiased_marker_ranking_all_core_genes.csv")
+)
+
+readr::write_csv(
+  selected_panel,
+  file.path(paths$tables, "21_unbiased_selected_validation_panel.csv")
+)
+
+ggsave(
+  file.path(paths$figures, "21_unbiased_marker_ranking.png"),
+  p_marker_rank,
+  width = 9, height = 6, dpi = 450, bg = "white"
+)
+
+message("Automated unbiased selected validation panel:")
+print(selected_panel %>% dplyr::select(
+  gene, axis, total_marker_score,
+  gene_cliffs_delta_TNBC_vs_ERpos, gene_FDR_BH, validation_tier
+))
+
+p_marker_rank
+```
+
+```{r Chunk 22 — Boxplots of automatically selected validation markers}
+# ----------------------------
+# Chunk 22 — Boxplots of automatically selected validation markers
+# Purpose:
+#   Plot patient-level expression for markers selected by Chunk 21.
+#   No predefined marker list is used.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+})
+
+# ----------------------------
+# 22A — Load data
+# ----------------------------
+
+expr_z <- readRDS(file.path(paths$processed, "11_expr_z_focused_ERpos_TNBC_repSAFE.rds"))
+clin   <- readRDS(file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+selected_panel <- readr::read_csv(
+  file.path(paths$tables, "21_unbiased_selected_validation_panel.csv"),
+  show_col_types = FALSE
+)
+
+markers <- selected_panel$gene
+
+missing_markers <- setdiff(markers, rownames(expr_z))
+if (length(missing_markers) > 0) {
+  stop("Missing selected markers in expression matrix: ", paste(missing_markers, collapse = ", "))
+}
+
+stopifnot(all(colnames(expr_z) == clin$sample_id))
+
+# ----------------------------
+# 22B — Prepare expression table
+# ----------------------------
+
+df <- as.data.frame(t(expr_z[markers, , drop = FALSE]))
+df$sample_id <- rownames(df)
+
+df <- df %>%
+  left_join(
+    clin %>% select(sample_id, focused_group_ERpos_TNBC),
+    by = "sample_id"
+  ) %>%
+  filter(focused_group_ERpos_TNBC %in% c("ERpos", "TNBC")) %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+df_long <- df %>%
+  pivot_longer(
+    cols = all_of(markers),
+    names_to = "gene",
+    values_to = "z_expression"
+  ) %>%
+  filter(is.finite(z_expression)) %>%
+  left_join(
+    selected_panel %>% select(gene, axis, validation_tier),
+    by = "gene"
+  ) %>%
+  mutate(
+    gene = factor(gene, levels = markers),
+    gene_label = paste0(gene, "\n", axis)
+  )
+
+n_table <- df_long %>%
+  distinct(sample_id, focused_group_ERpos_TNBC) %>%
+  dplyr::count(focused_group_ERpos_TNBC, name = "n")
+
+n_ERpos <- n_table$n[n_table$focused_group_ERpos_TNBC == "ERpos"]
+n_TNBC  <- n_table$n[n_table$focused_group_ERpos_TNBC == "TNBC"]
+
+# ----------------------------
+# 22C — Manual Cliff's delta
+# Positive = higher in TNBC
+# ----------------------------
+
+cliffs_delta_tnbc_vs_erpos <- function(x_er, x_tn) {
+  x_er <- x_er[is.finite(x_er)]
+  x_tn <- x_tn[is.finite(x_tn)]
+
+  if (length(x_er) < 5 || length(x_tn) < 5) return(NA_real_)
+
+  diff_mat <- outer(x_tn, x_er, FUN = "-")
+
+  (sum(diff_mat > 0) - sum(diff_mat < 0)) /
+    (length(x_tn) * length(x_er))
+}
+
+# ----------------------------
+# 22D — Gene-level stats
+# ----------------------------
+
+stats_wilcox <- df_long %>%
+  group_by(gene, gene_label, axis) %>%
+  summarise(
+    n_ERpos = sum(focused_group_ERpos_TNBC == "ERpos"),
+    n_TNBC  = sum(focused_group_ERpos_TNBC == "TNBC"),
+
+    median_ERpos = median(z_expression[focused_group_ERpos_TNBC == "ERpos"], na.rm = TRUE),
+    median_TNBC  = median(z_expression[focused_group_ERpos_TNBC == "TNBC"], na.rm = TRUE),
+
+    delta_median_TNBC_minus_ERpos = median_TNBC - median_ERpos,
+
+    cliffs_delta_TNBC_vs_ERpos = cliffs_delta_tnbc_vs_erpos(
+      z_expression[focused_group_ERpos_TNBC == "ERpos"],
+      z_expression[focused_group_ERpos_TNBC == "TNBC"]
+    ),
+
+    p_value = suppressWarnings(
+      wilcox.test(z_expression ~ focused_group_ERpos_TNBC)$p.value
+    ),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    FDR_BH = p.adjust(p_value, method = "BH"),
+    direction = case_when(
+      cliffs_delta_TNBC_vs_ERpos > 0 ~ "TNBC higher",
+      cliffs_delta_TNBC_vs_ERpos < 0 ~ "ERpos higher",
+      TRUE ~ "No shift"
+    ),
+    label = paste0(
+      "FDR=", signif(FDR_BH, 2),
+      "\nΔ=", round(cliffs_delta_TNBC_vs_ERpos, 2)
+    )
+  )
+
+y_pos <- df_long %>%
+  group_by(gene, gene_label) %>%
+  summarise(
+    y.position = max(z_expression, na.rm = TRUE) +
+      0.12 * diff(range(z_expression, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+stats_plot <- stats_wilcox %>%
+  left_join(y_pos, by = c("gene", "gene_label"))
+
+# ----------------------------
+# 22E — Plot without stat_pvalue_manual dependency
+# ----------------------------
+
+p_marker_box <- ggplot(
+  df_long,
+  aes(x = focused_group_ERpos_TNBC, y = z_expression, fill = focused_group_ERpos_TNBC)
+) +
+  geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA,
+    alpha = 0.85,
+    linewidth = 0.45
+  ) +
+  geom_jitter(
+    width = 0.12,
+    size = 0.35,
+    alpha = 0.12
+  ) +
+  geom_segment(
+    data = stats_plot,
+    aes(x = 1, xend = 2, y = y.position, yend = y.position),
+    inherit.aes = FALSE,
+    linewidth = 0.4
+  ) +
+  geom_text(
+    data = stats_plot,
+    aes(x = 1.5, y = y.position, label = label),
+    inherit.aes = FALSE,
+    size = 3.2
+  ) +
+  facet_wrap(~gene_label, scales = "free_y", ncol = 2) +
+  scale_fill_manual(
+    values = c("ERpos" = "#E64B35", "TNBC" = "#4DBBD5")
+  ) +
+  labs(
+    title = "Expression of automatically selected ferroptosis validation markers",
+    subtitle = paste0(
+      "Markers selected by unbiased axis-first ranking; ERpos (n=", n_ERpos,
+      ") vs TNBC (n=", n_TNBC,
+      "); Δ = Cliff's delta, positive values indicate higher TNBC expression"
+    ),
+    x = NULL,
+    y = "Gene expression (Z-score)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+# ----------------------------
+# 22F — Save outputs
+# ----------------------------
+
+readr::write_csv(
+  stats_wilcox,
+  file.path(paths$tables, "22_unbiased_selected_marker_expression_statistics.csv")
+)
+
+readr::write_csv(
+  df_long,
+  file.path(paths$tables, "22_unbiased_selected_marker_expression_long.csv")
+)
+
+ggsave(
+  file.path(paths$figures, "22_unbiased_selected_marker_expression_boxplots.png"),
+  p_marker_box,
+  width = 10,
+  height = 6.5,
+  dpi = 600,
+  bg = "white"
+)
+
+message("Automatically selected markers plotted:")
+print(stats_wilcox)
+
+p_marker_box
+
+```
+
+TNBC shows a ferroptosis-pressure state with robust PUFA, lipid-peroxidation, and mitochondrial-axis activation, while ERpos shows stronger GPX4/Selenium buffering. Differential wiring indicates that TNBC couples ferroptosis-driving axes to antioxidant defense systems, suggesting a ferroptosis-prone but compensated/dependency state.
+
+```{r Chunk 23 — Final discovery evidence summary}
+
+# ----------------------------
+# Chunk 23 — Final discovery evidence summary
+# Pipeline:
+#   Axis → robustness → wiring → marker → synthesis
+#
+# Purpose:
+#   Integrate all discovery-level evidence into:
+#     1) Unified axis summary table
+#     2) Publication-ready synthesis plot
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(tidyr)
+})
+
+# ----------------------------
+# 23A — Load inputs from previous chunks
+# ----------------------------
+
+axis_signature <- readr::read_csv(
+  file.path(paths$tables, "15_ERpos_TNBC_weighted_axis_signature.csv"),
+  show_col_types = FALSE
+)
+
+downsample_summary <- readr::read_csv(
+  file.path(paths$tables, "16_downsampling_ERpos_to_TNBC_summary.csv"),
+  show_col_types = FALSE
+)
+
+consistency_summary <- readr::read_csv(
+  file.path(paths$tables, "17_weighted_unweighted_consistency_summary.csv"),
+  show_col_types = FALSE
+)
+
+wiring_edges <- readr::read_csv(
+  file.path(paths$tables, "19_permutation_differential_wiring_all_edges.csv"),
+  show_col_types = FALSE
+)
+
+selected_panel <- readr::read_csv(
+  file.path(paths$tables, "21_unbiased_selected_validation_panel.csv"),
+  show_col_types = FALSE
+)
+
+axes_order <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+# ----------------------------
+# 23B — Wiring summary per axis
+# ----------------------------
+
+wiring_summary <- wiring_edges %>%
+  filter(FDR_BH < 0.05) %>%
+  pivot_longer(
+    cols = c(axis_1, axis_2),
+    names_to = "axis_position",
+    values_to = "axis"
+  ) %>%
+  group_by(axis) %>%
+  summarise(
+    n_sig_edges = n(),
+    max_abs_delta_rho = max(abs(delta_rho_TNBC_minus_ERpos), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ----------------------------
+# 23C — Integrate all evidence
+# ----------------------------
+
+final_axis_summary <- axis_signature %>%
+  select(
+    axis,
+    axis_FDR_BH = FDR_BH,
+    axis_delta = cliffs_delta_TNBC_vs_ERpos,
+    direction,
+    signature_support
+  ) %>%
+  left_join(
+    downsample_summary %>%
+      select(
+        axis,
+        robustness_class,
+        FDR_lt_0.05_freq,
+        direction_TNBC_higher_freq
+      ),
+    by = "axis"
+  ) %>%
+  left_join(
+    consistency_summary %>%
+      select(axis, consistent_signature),
+    by = "axis"
+  ) %>%
+  left_join(
+    wiring_summary,
+    by = "axis"
+  ) %>%
+  mutate(
+    n_sig_edges = replace_na(n_sig_edges, 0),
+    max_abs_delta_rho = replace_na(max_abs_delta_rho, 0),
+
+    # classification for manuscript interpretation
+    biological_role = case_when(
+      axis_delta > 0 & robustness_class == "Strong" ~ "TNBC_ferroptosis_pressure",
+      axis_delta < 0 & robustness_class == "Strong" ~ "ERpos_ferroptosis_buffering",
+      TRUE ~ "Context_dependent"
+    )
+  ) %>%
+  arrange(axis_FDR_BH) %>%
+  mutate(
+    axis = factor(axis, levels = axes_order)
+  )
+
+# ----------------------------
+# 23D — Marker annotation per axis
+# ----------------------------
+
+axis_markers <- selected_panel %>%
+  group_by(axis) %>%
+  summarise(
+    selected_markers = paste(gene, collapse = ", "),
+    .groups = "drop"
+  )
+
+final_axis_summary <- final_axis_summary %>%
+  left_join(axis_markers, by = "axis")
+
+# ----------------------------
+# 23E — Save summary table
+# ----------------------------
+
+readr::write_csv(
+  final_axis_summary,
+  file.path(paths$tables, "23_final_discovery_axis_summary.csv")
+)
+
+# ----------------------------
+# 23F — Visualization (key synthesis plot)
+# ----------------------------
+
+p_summary <- ggplot(
+  final_axis_summary,
+  aes(x = axis_delta, y = axis)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+  geom_point(
+    aes(
+      size = n_sig_edges,
+      color = robustness_class
+    )
+  ) +
+  geom_text(
+    aes(label = selected_markers),
+    hjust = -0.1,
+    size = 3
+  ) +
+  scale_y_discrete(limits = rev(levels(final_axis_summary$axis))) +
+  scale_color_manual(
+    values = c(
+      "Strong" = "#D73027",
+      "Moderate" = "#FC8D59",
+      "Weak" = "#91BFDB"
+    )
+  ) +
+  labs(
+    title = "Integrated ferroptosis axis signature in breast cancer subtypes",
+    subtitle = "Combining subtype difference, robustness, and differential wiring evidence",
+    x = "Cliff's delta (TNBC vs ERpos)",
+    y = NULL,
+    size = "Significant wiring edges",
+    color = "Robustness"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  file.path(paths$figures, "23_final_discovery_axis_summary.png"),
+  p_summary,
+  width = 9,
+  height = 6,
+  dpi = 500,
+  bg = "white"
+)
+
+# ----------------------------
+# 23G — Print outputs
+# ----------------------------
+
+message("Final discovery axis summary:")
+print(final_axis_summary)
+
+p_summary
+
+```
+Validation plan
+1. Independent computational validation first
+
+Use METABRIC as the main external validation.
+
+Validate the same three things:
+
+A. Axis-level pattern
+TNBC/basal should show higher:
+
+PUFA_Loading
+DHODH_Mito
+Lipid_Peroxidation
+
+ERpos/luminal should show higher:
+
+GPX4_Selenium
+
+B. Wiring pattern
+Check whether the main TNBC-strengthened edges replicate:
+
+GPX4_Selenium ↔ PUFA_Loading
+DHODH_Mito ↔ PUFA_Loading
+Iron_Handling ↔ BH4_GCH1
+Lipid_Peroxidation-related edges
+
+C. Marker-level pattern
+Validate your automated markers:
+
+FADS2
+DHODH
+POR
+SEPSECS
+SLC40A1
+
+This is important because your automated selection is based on axis robustness, wiring support, and gene-level subtype evidence, not predefined famous markers.
+
+Wet-lab pilot validation
+
+Use your patient tissue samples as a pilot qPCR validation.
+
+Recommended minimal panel
+
+I would not use all five immediately if budget is limited.
+
+Use:
+
+FADS2 — PUFA loading / TNBC ferroptosis-pressure marker
+DHODH — mitochondrial ferroptosis-linked axis
+POR — lipid peroxidation axis
+SEPSECS — GPX4/Selenium defense axis, ERpos-buffering side
+
+Optional fifth:
+
+SLC40A1 — iron handling, but interpret carefully because it is lower in TNBC in your result.
+Why this plan is strong
+
+Because it validates the model, not just single genes:
+
+TNBC side:
+
+FADS2 ↑
+DHODH ↑
+POR ↑
+
+This supports:
+
+TNBC has higher ferroptosis-pressure biology.
+
+ERpos side:
+
+SEPSECS ↑
+possibly SLC40A1 ↑
+
+This supports:
+
+ERpos has stronger buffering/iron-handling defense features.
+
+Best tissue design
+
+Use primary invasive breast carcinoma samples:
+
+10–15 TNBC
+10–15 ERpos/HER2−
+tumor-rich area, ideally >50–70%
+avoid post-neoadjuvant samples
+avoid necrotic tissue
+record grade, Ki67, ER/PR/HER2
+Final validation logic
+
+Your paper can say:
+
+Markers for wet-lab validation were selected using an automated axis-first ranking strategy from the discovery pipeline, prioritizing genes from robust subtype-differential axes with differential wiring support and significant gene-level expression shifts.
+
+This is much better than saying “we selected ACSL4/GPX4/TFRC because they are known markers.” Your current pipeline already supports this because it defines conservative core axes first, then uses single genes later as marker-level support/experimental candidates rather than primary evidence
+
+TNBC has both high damage AND high defense reveals coordinated regulation between ferroptotic drivers and protective systems”

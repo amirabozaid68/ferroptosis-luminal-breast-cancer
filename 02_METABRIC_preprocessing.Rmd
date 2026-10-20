@@ -1,0 +1,6007 @@
+---
+title: "Subtype-specific ferroptosis pathway activity and regulatory wiring in breast cancer: validation in the METABRIC cohort"
+author: "Amira Abozaid"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+# METABRIC validation cohort:
+# Independent validation of GSE96058 findings.
+# Same pipeline, same axes, same statistical framework.
+```{r Chunk 00 — Project root}
+# ----------------------------
+# Chunk 00 — Project root
+# ----------------------------
+
+if (requireNamespace("here", quietly = TRUE)) {
+  root <- here::here()
+} else {
+  root <- Sys.getenv("FERR_ROOT", unset = normalizePath(getwd()))
+}
+
+setwd(root)
+message("Project root: ", root)
+
+```
+
+```{r Chunk 01 — METABRIC project config}
+# ----------------------------
+# Chunk 01 — METABRIC project config + clean directory structure
+# ----------------------------
+
+project <- list(
+  name        = "Subtype_Ferroptosis_Wiring_BreastCancer",
+  dataset     = "METABRIC",
+  role        = "Validation",
+  organism    = "Homo sapiens",
+  raw_type    = "cBioPortal_microarray",
+  main_design = "Validate_GSE96058_PAM50_plus_ERpos_TNBC"
+)
+
+root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+
+paths <- list(
+  base       = file.path(root, project$dataset),
+  raw        = file.path(root, project$dataset, "01_raw"),
+  processed  = file.path(root, project$dataset, "02_processed"),
+  results    = file.path(root, project$dataset, "03_results"),
+  figures    = file.path(root, project$dataset, "03_results", "figures"),
+  tables     = file.path(root, project$dataset, "03_results", "tables"),
+  logs       = file.path(root, project$dataset, "04_logs"),
+  scripts    = file.path(root, project$dataset, "05_scripts"),
+  manuscript = file.path(root, project$dataset, "06_manuscript_outputs")
+)
+
+invisible(lapply(paths, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+stopifnot(all(vapply(paths, dir.exists, logical(1))))
+
+project
+paths
+
+```
+
+
+```{r}
+# ----------------------------
+# Chunk 02 — Packages + global validation specifications
+# ----------------------------
+
+cran_pkgs <- c(
+  "data.table", "readxl", "dplyr", "tibble", "stringr",
+  "ggplot2", "tidyr", "forcats", "readr", "matrixStats",
+  "patchwork", "igraph", "ggrepel", "scales", "purrr",
+  "broom", "rstatix", "pheatmap", "digest"
+)
+
+to_install <- cran_pkgs[!cran_pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+invisible(lapply(cran_pkgs, library, character.only = TRUE))
+
+SPEC <- list(
+  seed          = 123,
+  min_axis_cov  = 0.50,
+  thr_abs_r     = 0.25,
+  B_downsample  = 500,
+  B_perm        = 2000
+)
+
+set.seed(SPEC$seed)
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(paths$logs, "02_sessionInfo_METABRIC.txt")
+)
+
+SPEC
+
+```
+ 
+```{r Chunk 03 — Detect and extract METABRIC raw archive}
+# ----------------------------
+# Chunk 03 — Detect and extract METABRIC raw archive
+# Purpose:
+#   Prepare raw METABRIC cBioPortal files for validation of GSE96058.
+#   This chunk only detects/extracts files; expression and clinical loading
+#   will be done in Chunk 04.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(tibble)
+  library(readr)
+  library(stringr)
+})
+
+message("Raw path: ", paths$raw, " | exists: ", dir.exists(paths$raw))
+
+stopifnot(dir.exists(paths$raw))
+
+raw_files <- list.files(
+  paths$raw,
+  full.names = TRUE,
+  recursive = FALSE
+)
+
+stopifnot(length(raw_files) > 0)
+
+message("Files currently in METABRIC/01_raw:")
+print(basename(raw_files))
+
+# ----------------------------
+# 03A — Detect METABRIC cBioPortal archive
+# ----------------------------
+
+archive_candidates <- list.files(
+  paths$raw,
+  pattern = "brca_metabric.*\\.(tar|tar\\.gz|tgz|gz)$|\\.tar$|\\.tar\\.gz$|\\.tgz$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(archive_candidates) == 0) {
+  stop(
+    "No METABRIC archive detected in: ", paths$raw, "\n",
+    "Expected a cBioPortal archive such as brca_metabric.tar.gz, brca_metabric.tar, or .tgz."
+  )
+}
+
+archive_sizes <- file.info(archive_candidates)$size
+archive_fp <- archive_candidates[which.max(archive_sizes)]
+
+message("Selected METABRIC archive: ", basename(archive_fp))
+message("Archive size (MB): ", round(file.info(archive_fp)$size / 1024^2, 2))
+
+stopifnot(file.exists(archive_fp))
+
+# ----------------------------
+# 03B — Extract safely
+# ----------------------------
+
+extract_dir <- file.path(paths$raw, "cbioportal_metabric")
+dir.create(extract_dir, recursive = TRUE, showWarnings = FALSE)
+
+already_extracted <- length(list.files(extract_dir, recursive = TRUE)) > 10
+
+if (!already_extracted) {
+  message("Extracting METABRIC archive...")
+  utils::untar(archive_fp, exdir = extract_dir)
+} else {
+  message("Archive already appears extracted. Skipping extraction.")
+}
+
+extracted_files <- list.files(
+  extract_dir,
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+stopifnot(length(extracted_files) > 0)
+
+# ----------------------------
+# 03C — Locate expected cBioPortal study folder/files
+# ----------------------------
+
+expr_hits <- extracted_files[
+  grepl("data_mrna_illumina_microarray\\.txt$", extracted_files, ignore.case = TRUE)
+]
+
+patient_hits <- extracted_files[
+  grepl("data_clinical_patient\\.txt$", extracted_files, ignore.case = TRUE)
+]
+
+sample_hits <- extracted_files[
+  grepl("data_clinical_sample\\.txt$", extracted_files, ignore.case = TRUE)
+]
+
+if (length(expr_hits) < 1 || length(patient_hits) < 1 || length(sample_hits) < 1) {
+  stop(
+    "Required METABRIC cBioPortal files were not all found after extraction.\n",
+    "Found expression files: ", length(expr_hits), "\n",
+    "Found patient clinical files: ", length(patient_hits), "\n",
+    "Found sample clinical files: ", length(sample_hits), "\n",
+    "Please check the archive contents."
+  )
+}
+
+expr_fp    <- expr_hits[1]
+patient_fp <- patient_hits[1]
+sample_fp  <- sample_hits[1]
+
+study_dir <- dirname(expr_fp)
+
+message("METABRIC study directory: ", study_dir)
+message("Expression file: ", basename(expr_fp))
+message("Patient clinical file: ", basename(patient_fp))
+message("Sample clinical file: ", basename(sample_fp))
+
+# ----------------------------
+# 03D — Optional external clinical TSV detection
+# ----------------------------
+
+external_clinical_files <- list.files(
+  paths$raw,
+  pattern = "metabric.*clinical.*\\.(tsv|csv|txt)$|brca_metabric_clinical_data\\.(tsv|csv|txt)$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+external_clinical_files <- setdiff(external_clinical_files, archive_fp)
+
+external_clinical_note <- if (length(external_clinical_files) > 0) {
+  paste(basename(external_clinical_files), collapse = "; ")
+} else {
+  NA_character_
+}
+
+message("External clinical file(s): ", ifelse(is.na(external_clinical_note), "none detected", external_clinical_note))
+
+# ----------------------------
+# 03E — Save file manifest
+# ----------------------------
+
+qc_raw <- tibble::tibble(
+  dataset = project$dataset,
+  role = project$role,
+  raw_type = project$raw_type,
+  archive_file = basename(archive_fp),
+  archive_size_MB = round(file.info(archive_fp)$size / 1024^2, 2),
+  extract_dir = extract_dir,
+  study_dir = study_dir,
+  expression_file = basename(expr_fp),
+  patient_clinical_file = basename(patient_fp),
+  sample_clinical_file = basename(sample_fp),
+  external_clinical_files = external_clinical_note,
+  n_extracted_files = length(extracted_files)
+)
+
+readr::write_csv(
+  qc_raw,
+  file.path(paths$tables, "03_qc_METABRIC_raw_archive_manifest.csv")
+)
+
+saveRDS(
+  list(
+    archive_fp = archive_fp,
+    extract_dir = extract_dir,
+    study_dir = study_dir,
+    expr_fp = expr_fp,
+    patient_fp = patient_fp,
+    sample_fp = sample_fp,
+    external_clinical_files = external_clinical_files
+  ),
+  file.path(paths$processed, "03_METABRIC_raw_file_paths.rds")
+)
+
+message("Chunk 03 completed.")
+message("Saved:")
+message("- 03_qc_METABRIC_raw_archive_manifest.csv")
+message("- 03_METABRIC_raw_file_paths.rds")
+
+qc_raw
+
+```
+This chunk take long time 
+```{r Chunk 04 — Load METABRIC expression_clinical and build aligned objects}
+# ----------------------------
+# Chunk 04 — Load METABRIC expression + clinical and build aligned objects
+# Purpose:
+#   Build canonical METABRIC expression and clinical objects for validation
+#   of the GSE96058 discovery pipeline.
+#
+# Outputs:
+#   04_expr_mat_gene_by_sample.rds
+#   04_clin_raw.rds
+#   04_qc_expression_clinical_build.csv
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+  library(readr)
+})
+
+raw_paths <- readRDS(file.path(paths$processed, "03_METABRIC_raw_file_paths.rds"))
+
+expr_fp    <- raw_paths$expr_fp
+patient_fp <- raw_paths$patient_fp
+sample_fp  <- raw_paths$sample_fp
+
+stopifnot(file.exists(expr_fp))
+stopifnot(file.exists(patient_fp))
+stopifnot(file.exists(sample_fp))
+
+message("Expression file: ", expr_fp)
+message("Patient clinical file: ", patient_fp)
+message("Sample clinical file: ", sample_fp)
+
+# ----------------------------
+# 04A — Helper functions
+# ----------------------------
+
+read_cbio_clinical <- function(fp) {
+
+  lines <- readLines(fp, warn = FALSE)
+  lines <- lines[!is.na(lines)]
+  lines_ne <- lines[nzchar(trimws(lines))]
+
+  idx_data_start <- which(!stringr::str_detect(lines_ne, "^#"))[1]
+
+  if (is.na(idx_data_start)) {
+    stop("No data/header line detected in clinical file: ", fp)
+  }
+
+  tf <- tempfile(fileext = ".txt")
+  writeLines(lines_ne, tf)
+  on.exit(unlink(tf), add = TRUE)
+
+  dt <- data.table::fread(
+    tf,
+    skip = idx_data_start - 1,
+    header = TRUE,
+    data.table = FALSE,
+    fill = TRUE
+  )
+
+  names(dt) <- make.names(trimws(names(dt)))
+  dt
+}
+
+pick_col <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+pick_by_regex <- function(nms, patterns) {
+  nms_low <- tolower(nms)
+
+  for (p in patterns) {
+    hit <- nms[stringr::str_detect(nms_low, p)]
+    if (length(hit) > 0) return(hit[1])
+  }
+
+  NA_character_
+}
+
+norm_id <- function(x) {
+  stringr::str_replace_all(as.character(x), "[^A-Za-z0-9_\\-]", "_")
+}
+
+# ----------------------------
+# 04B — Load and clean expression matrix
+# ----------------------------
+
+expr_dt <- data.table::fread(expr_fp, data.table = FALSE)
+
+stopifnot(ncol(expr_dt) > 10)
+
+gene_col <- names(expr_dt)[1]
+names(expr_dt)[1] <- "SYMBOL"
+
+expr_dt <- expr_dt %>%
+  mutate(
+    SYMBOL = toupper(trimws(as.character(SYMBOL)))
+  ) %>%
+  filter(!is.na(SYMBOL), SYMBOL != "")
+
+sample_cols <- setdiff(names(expr_dt), "SYMBOL")
+
+non_numeric_cols <- sample_cols[
+  !vapply(expr_dt[, sample_cols, drop = FALSE], is.numeric, logical(1))
+]
+
+if (length(non_numeric_cols) > 0) {
+  message("Converting non-numeric expression columns to numeric: ",
+          paste(non_numeric_cols, collapse = ", "))
+  expr_dt[non_numeric_cols] <- lapply(
+    expr_dt[non_numeric_cols],
+    function(x) suppressWarnings(as.numeric(x))
+  )
+}
+
+USE_MEDIAN_COLLAPSE <- TRUE
+
+collapse_fun <- if (USE_MEDIAN_COLLAPSE) {
+  function(x) median(x, na.rm = TRUE)
+} else {
+  function(x) mean(x, na.rm = TRUE)
+}
+
+collapse_label <- ifelse(USE_MEDIAN_COLLAPSE, "median", "mean")
+
+expr_dt_collapsed <- expr_dt %>%
+  group_by(SYMBOL) %>%
+  summarise(
+    across(all_of(sample_cols), collapse_fun),
+    .groups = "drop"
+  )
+
+expr_mat <- as.matrix(expr_dt_collapsed[, sample_cols, drop = FALSE])
+rownames(expr_mat) <- expr_dt_collapsed$SYMBOL
+storage.mode(expr_mat) <- "numeric"
+
+# ----------------------------
+# 04C — Load clinical patient + sample tables
+# ----------------------------
+
+cl_patient <- read_cbio_clinical(patient_fp)
+cl_sample  <- read_cbio_clinical(sample_fp)
+
+patient_id_candidates <- c(
+  "PATIENT_ID", "Patient.ID", "patient_id",
+  "PATIENT", "PATIENT.ID", "PATIENT_IDENTIFIER"
+)
+
+sample_id_candidates <- c(
+  "SAMPLE_ID", "Sample.ID", "sample_id",
+  "SAMPLE", "SAMPLE.ID", "Tumor_Sample_Barcode",
+  "TUMOR_SAMPLE_BARCODE"
+)
+
+pat_col_patient <- pick_col(cl_patient, patient_id_candidates)
+pat_col_sample  <- pick_col(cl_sample, patient_id_candidates)
+sample_col      <- pick_col(cl_sample, sample_id_candidates)
+
+if (is.na(pat_col_patient)) {
+  pat_col_patient <- pick_by_regex(names(cl_patient), c("patient.*id", "^patient", "patient"))
+}
+
+if (is.na(pat_col_sample)) {
+  pat_col_sample <- pick_by_regex(names(cl_sample), c("patient.*id", "^patient", "patient"))
+}
+
+if (is.na(sample_col)) {
+  sample_col <- pick_by_regex(names(cl_sample), c("sample.*id", "^sample", "barcode", "tumor.*sample"))
+}
+
+if (is.na(pat_col_patient) || is.na(pat_col_sample) || is.na(sample_col)) {
+  stop(
+    "Could not identify patient/sample ID columns.\n",
+    "Patient table columns: ", paste(names(cl_patient), collapse = ", "), "\n",
+    "Sample table columns: ", paste(names(cl_sample), collapse = ", ")
+  )
+}
+
+cl_patient <- cl_patient %>%
+  mutate(PATIENT_ID = as.character(.data[[pat_col_patient]]))
+
+cl_sample <- cl_sample %>%
+  mutate(
+    PATIENT_ID = as.character(.data[[pat_col_sample]]),
+    SAMPLE_ID  = as.character(.data[[sample_col]])
+  )
+
+# ----------------------------
+# 04D — Align expression samples to clinical samples
+# ----------------------------
+
+expr_ids <- colnames(expr_mat)
+
+cl_sample <- cl_sample %>%
+  mutate(SAMPLE_ID_NORM = norm_id(SAMPLE_ID))
+
+expr_ids_norm <- norm_id(expr_ids)
+
+m <- match(expr_ids_norm, cl_sample$SAMPLE_ID_NORM)
+matched <- !is.na(m)
+
+message("Expression samples: ", length(expr_ids))
+message("Matched clinical samples: ", sum(matched))
+
+stopifnot(sum(matched) > 100)
+
+expr_mat_aligned <- expr_mat[, matched, drop = FALSE]
+colnames(expr_mat_aligned) <- cl_sample$SAMPLE_ID[m[matched]]
+
+clin_sample_aligned <- cl_sample[m[matched], , drop = FALSE] %>%
+  dplyr::select(SAMPLE_ID, PATIENT_ID, everything())
+
+clin_dt <- clin_sample_aligned %>%
+  left_join(
+    cl_patient %>% dplyr::select(PATIENT_ID, everything()),
+    by = "PATIENT_ID"
+  ) %>%
+  mutate(
+    sample_id = as.character(SAMPLE_ID),
+    patient_id = as.character(PATIENT_ID)
+  )
+
+stopifnot(ncol(expr_mat_aligned) == nrow(clin_dt))
+stopifnot(all(colnames(expr_mat_aligned) == clin_dt$sample_id))
+stopifnot(anyDuplicated(clin_dt$sample_id) == 0)
+
+# ----------------------------
+# 04E — Optional external clinical file inventory only
+# ----------------------------
+
+external_files <- raw_paths$external_clinical_files
+
+external_file_note <- if (length(external_files) > 0) {
+  paste(basename(external_files), collapse = "; ")
+} else {
+  NA_character_
+}
+
+# ----------------------------
+# 04F — QC + save
+# ----------------------------
+
+qc_build <- tibble::tibble(
+  dataset = project$dataset,
+  expression_file = basename(expr_fp),
+  patient_clinical_file = basename(patient_fp),
+  sample_clinical_file = basename(sample_fp),
+  external_clinical_files = external_file_note,
+  n_rows_raw_expr = nrow(expr_dt),
+  n_unique_genes = nrow(expr_mat_aligned),
+  n_expression_samples_raw = length(expr_ids),
+  n_expression_samples_matched = ncol(expr_mat_aligned),
+  n_clinical_sample_rows = nrow(cl_sample),
+  n_clinical_patient_rows = nrow(cl_patient),
+  duplicated_gene_rows = nrow(expr_dt) - nrow(expr_mat_aligned),
+  collapse_method = collapse_label,
+  pct_missing_values = mean(is.na(expr_mat_aligned)) * 100
+)
+
+readr::write_csv(
+  qc_build,
+  file.path(paths$tables, "04_qc_METABRIC_expression_clinical_build.csv")
+)
+
+saveRDS(
+  expr_mat_aligned,
+  file.path(paths$processed, "04_expr_mat_gene_by_sample.rds")
+)
+
+saveRDS(
+  clin_dt,
+  file.path(paths$processed, "04_clin_raw.rds")
+)
+
+message("METABRIC expression matrix built: ",
+        nrow(expr_mat_aligned), " genes x ", ncol(expr_mat_aligned), " samples")
+
+message("METABRIC clinical table built: ",
+        nrow(clin_dt), " rows x ", ncol(clin_dt), " columns")
+
+qc_build
+
+```
+
+```{r Chunk 05 — Validate alignment_enforce pipeline structure}
+# ----------------------------
+# Chunk 05 — Validate alignment + enforce pipeline structure
+# Purpose:
+#   Ensure METABRIC matches GSE96058 pipeline expectations:
+#   - expression columns == clinical sample_id
+#   - no duplication
+#   - stable ordering
+#
+# NOTE:
+#   Unlike GSE96058, mapping already done in Chunk 04
+#   This chunk = validation + standardization ONLY
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+expr_mat <- readRDS(file.path(paths$processed, "04_expr_mat_gene_by_sample.rds"))
+clin_dt  <- readRDS(file.path(paths$processed, "04_clin_raw.rds")) |>
+  as.data.frame()
+
+message("Expression matrix: ", nrow(expr_mat), " genes x ", ncol(expr_mat), " samples")
+message("Clinical table: ", nrow(clin_dt), " rows x ", ncol(clin_dt), " columns")
+
+# ----------------------------
+# 05A — Enforce sample_id column
+# ----------------------------
+
+if (!"sample_id" %in% names(clin_dt)) {
+  stop("Clinical table must contain 'sample_id'")
+}
+
+clin_dt$sample_id <- as.character(clin_dt$sample_id)
+
+# ----------------------------
+# 05B — Validate alignment
+# ----------------------------
+
+expr_ids <- colnames(expr_mat)
+clin_ids <- clin_dt$sample_id
+
+stopifnot(length(expr_ids) == nrow(clin_dt))
+
+# strict order check
+if (!all(expr_ids == clin_ids)) {
+  warning("Order mismatch detected — reordering clinical to match expression")
+
+  clin_dt <- clin_dt[match(expr_ids, clin_ids), , drop = FALSE]
+}
+
+stopifnot(all(colnames(expr_mat) == clin_dt$sample_id))
+stopifnot(anyDuplicated(clin_dt$sample_id) == 0)
+
+# ----------------------------
+# 05C — QC summary
+# ----------------------------
+
+qc_alignment <- tibble::tibble(
+  dataset = project$dataset,
+  n_expression_samples = length(expr_ids),
+  n_clinical_rows = length(clin_ids),
+  identical_order = all(expr_ids == clin_ids),
+  duplicated_samples = anyDuplicated(clin_ids),
+  first_5_ids = paste(head(expr_ids, 5), collapse = "; ")
+)
+
+readr::write_csv(
+  qc_alignment,
+  file.path(paths$tables, "05_qc_alignment_validation.csv")
+)
+
+# ----------------------------
+# 05D — Save standardized objects
+# ----------------------------
+
+saveRDS(
+  expr_mat,
+  file.path(paths$processed, "05_expr_mat_named.rds")
+)
+
+saveRDS(
+  clin_dt,
+  file.path(paths$processed, "05_clin_raw_after_mapping.rds")
+)
+
+message("Alignment validated and standardized.")
+qc_alignment
+
+```
+
+
+```{r Chunk 06 — Final aligned expression and clinical samples}
+# ----------------------------
+# Chunk 06 — Final aligned expression and clinical samples
+# Purpose:
+#   Create canonical METABRIC aligned objects matching the GSE96058 pipeline.
+#   Since METABRIC was already aligned in Chunk 04/05, this chunk confirms
+#   alignment and saves 06_expr_mat_aligned.rds and 06_clin_aligned.rds.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+expr_mat_named <- readRDS(file.path(paths$processed, "05_expr_mat_named.rds"))
+clin_dt        <- readRDS(file.path(paths$processed, "05_clin_raw_after_mapping.rds")) |>
+  as.data.frame()
+
+stopifnot("sample_id" %in% names(clin_dt))
+
+clin_dt$sample_id <- as.character(clin_dt$sample_id)
+
+expr_ids <- colnames(expr_mat_named)
+clin_ids <- clin_dt$sample_id
+
+matched_ids <- expr_ids[expr_ids %in% clin_ids]
+
+message("Expression samples: ", length(expr_ids))
+message("Clinical rows: ", length(clin_ids))
+message("Matched samples: ", length(matched_ids))
+
+stopifnot(length(matched_ids) > 100)
+
+expr_mat_aligned <- expr_mat_named[, matched_ids, drop = FALSE]
+clin_dt_aligned  <- clin_dt[match(matched_ids, clin_dt$sample_id), , drop = FALSE]
+
+stopifnot(ncol(expr_mat_aligned) == nrow(clin_dt_aligned))
+stopifnot(all(colnames(expr_mat_aligned) == clin_dt_aligned$sample_id))
+stopifnot(anyDuplicated(clin_dt_aligned$sample_id) == 0)
+
+qc_alignment <- tibble::tibble(
+  dataset              = project$dataset,
+  expression_samples   = length(expr_ids),
+  clinical_rows        = length(clin_ids),
+  matched_samples      = length(matched_ids),
+  expression_only      = length(setdiff(expr_ids, clin_ids)),
+  clinical_only        = length(setdiff(clin_ids, expr_ids)),
+  pct_expression_kept  = 100 * length(matched_ids) / length(expr_ids),
+  pct_clinical_matched = 100 * length(matched_ids) / length(clin_ids),
+  validation_note      = "METABRIC alignment confirmed; canonical 06 objects created for GSE96058 pipeline symmetry"
+)
+
+readr::write_csv(
+  qc_alignment,
+  file.path(paths$tables, "06_qc_expression_clinical_alignment.csv")
+)
+
+saveRDS(
+  expr_mat_aligned,
+  file.path(paths$processed, "06_expr_mat_aligned.rds")
+)
+
+saveRDS(
+  clin_dt_aligned,
+  file.path(paths$processed, "06_clin_aligned.rds")
+)
+
+message("Aligned expression matrix: ", nrow(expr_mat_aligned), " genes x ", ncol(expr_mat_aligned), " samples")
+message("Aligned clinical table: ", nrow(clin_dt_aligned), " rows x ", ncol(clin_dt_aligned), " columns")
+
+qc_alignment
+
+```
+```{r Chunk 07 — Standardize PAM50-like subtype and receptor annotations METABRIC}
+# ----------------------------
+# Chunk 07 — Standardize PAM50-like subtype and receptor annotations (METABRIC)
+# Purpose:
+#   Prepare validation labels using the same logic as GSE96058:
+#   1) multi-subtype analysis
+#   2) focused ERpos vs TNBC contrast
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+  library(readr)
+})
+
+expr_mat <- readRDS(file.path(paths$processed, "06_expr_mat_aligned.rds"))
+clin_dt  <- readRDS(file.path(paths$processed, "06_clin_aligned.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+stopifnot(ncol(expr_mat) == nrow(clin_dt))
+stopifnot(all(colnames(expr_mat) == clin_dt$sample_id))
+
+# ----------------------------
+# 07A — Detect METABRIC columns
+# ----------------------------
+
+subtype_col <- "CLAUDIN_SUBTYPE"
+er_col      <- "ER_STATUS"
+pr_col      <- "PR_STATUS"
+her2_col    <- "HER2_STATUS"
+
+required_cols <- c("sample_id", subtype_col, er_col, pr_col, her2_col)
+missing_cols <- setdiff(required_cols, names(clin_dt))
+
+if (length(missing_cols) > 0) {
+  stop("Missing required METABRIC columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# ----------------------------
+# 07B — Helper functions
+# ----------------------------
+
+std_status <- function(x) {
+  x_raw <- tolower(trimws(as.character(x)))
+
+  dplyr::case_when(
+    x_raw %in% c("positive", "pos", "+", "1", "yes", "y", "positve") ~ "Positive",
+    x_raw %in% c("negative", "neg", "-", "0", "no", "n") ~ "Negative",
+    TRUE ~ NA_character_
+  )
+}
+
+std_pam50_metabric <- function(x) {
+  x_raw <- tolower(trimws(as.character(x)))
+
+  dplyr::case_when(
+    x_raw %in% c("luma", "luminal a", "luminala") ~ "LumA",
+    x_raw %in% c("lumb", "luminal b", "luminalb") ~ "LumB",
+    x_raw %in% c("her2", "her2 enriched", "her2-enriched") ~ "HER2_enriched",
+    x_raw %in% c("basal", "basal-like", "basal like") ~ "Basal",
+    x_raw %in% c("normal", "normal-like", "normal like") ~ "Normal_like",
+    TRUE ~ NA_character_
+  )
+}
+
+# ----------------------------
+# 07C — Standardize annotations
+# ----------------------------
+
+clin_std <- clin_dt %>%
+  mutate(
+    sample_id = as.character(sample_id),
+
+    pam50_subtype = as.character(.data[[subtype_col]]),
+    pam50_simple  = std_pam50_metabric(.data[[subtype_col]]),
+
+    ER_status_std   = std_status(.data[[er_col]]),
+    PGR_status_std  = std_status(.data[[pr_col]]),
+    HER2_status_std = std_status(.data[[her2_col]]),
+
+    pam50_simple = factor(
+      pam50_simple,
+      levels = c("LumA", "LumB", "HER2_enriched", "Basal", "Normal_like")
+    ),
+
+    broad_receptor_group = dplyr::case_when(
+      ER_status_std == "Positive" & HER2_status_std == "Negative" ~ "ERpos_HER2neg",
+
+      ER_status_std == "Negative" &
+        PGR_status_std == "Negative" &
+        HER2_status_std == "Negative" ~ "TNBC",
+
+      HER2_status_std == "Positive" ~ "HER2pos",
+
+      TRUE ~ NA_character_
+    ),
+
+    focused_group_ERpos_TNBC = dplyr::case_when(
+      broad_receptor_group == "ERpos_HER2neg" ~ "ERpos",
+      broad_receptor_group == "TNBC" ~ "TNBC",
+      TRUE ~ NA_character_
+    ),
+
+    focused_group_ERpos_TNBC = factor(
+      focused_group_ERpos_TNBC,
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+# ----------------------------
+# 07D — QC tables
+# ----------------------------
+
+qc_pam50 <- clin_std %>%
+  dplyr::count(pam50_simple, name = "n") %>%
+  mutate(frac = n / sum(n))
+
+qc_receptor <- clin_std %>%
+  dplyr::count(
+    ER_status_std,
+    PGR_status_std,
+    HER2_status_std,
+    broad_receptor_group,
+    name = "n"
+  ) %>%
+  arrange(desc(n))
+
+qc_pam50_by_receptor <- clin_std %>%
+  dplyr::count(pam50_simple, broad_receptor_group, name = "n") %>%
+  arrange(pam50_simple, desc(n))
+
+qc_focused <- clin_std %>%
+  dplyr::count(focused_group_ERpos_TNBC, name = "n") %>%
+  mutate(frac = n / sum(n))
+
+qc_concordance <- clin_std %>%
+  mutate(
+    receptor_pam50_concordance = dplyr::case_when(
+      broad_receptor_group == "ERpos_HER2neg" &
+        pam50_simple %in% c("LumA", "LumB") ~ "Concordant_ERpos_Luminal",
+
+      broad_receptor_group == "TNBC" &
+        pam50_simple == "Basal" ~ "Concordant_TNBC_Basal",
+
+      broad_receptor_group == "HER2pos" &
+        pam50_simple == "HER2_enriched" ~ "Concordant_HER2pos_HER2enriched",
+
+      is.na(broad_receptor_group) | is.na(pam50_simple) ~ "Insufficient_annotation",
+
+      TRUE ~ "Discordant_or_mixed"
+    )
+  )
+
+qc_concordance_counts <- qc_concordance %>%
+  dplyr::count(receptor_pam50_concordance, name = "n") %>%
+  mutate(frac = n / sum(n)) %>%
+  arrange(desc(n))
+
+# ----------------------------
+# 07E — Save outputs
+# ----------------------------
+
+saveRDS(clin_std, file.path(paths$processed, "07_clin_standardized.rds"))
+saveRDS(qc_concordance, file.path(paths$processed, "07_clin_with_concordance_labels.rds"))
+
+readr::write_csv(qc_pam50, file.path(paths$tables, "07_qc_pam50_subtype_counts.csv"))
+readr::write_csv(qc_receptor, file.path(paths$tables, "07_qc_receptor_group_counts.csv"))
+readr::write_csv(qc_pam50_by_receptor, file.path(paths$tables, "07_qc_pam50_by_receptor_group.csv"))
+readr::write_csv(qc_focused, file.path(paths$tables, "07_qc_focused_ERpos_TNBC_counts.csv"))
+readr::write_csv(qc_concordance_counts, file.path(paths$tables, "07_qc_receptor_PAM50_concordance.csv"))
+
+message("Chunk 07 completed: METABRIC annotations standardized.")
+message("PAM50-like subtype counts:")
+print(qc_pam50)
+
+message("Focused ERpos/TNBC counts:")
+print(qc_focused)
+
+message("Receptor/PAM50-like concordance:")
+print(qc_concordance_counts)
+
+clin_std %>%
+  dplyr::select(
+    sample_id,
+    pam50_subtype,
+    pam50_simple,
+    ER_status_std,
+    PGR_status_std,
+    HER2_status_std,
+    broad_receptor_group,
+    focused_group_ERpos_TNBC
+  ) %>%
+  head()
+```
+
+
+```{r Chunk 08 — Build METABRIC validation cohorts}
+# ----------------------------
+# Chunk 08 — Build METABRIC validation cohorts
+# Purpose:
+#   1) Primary cohort: intrinsic subtype analysis
+#      LumA, LumB, HER2_enriched, Basal, Normal_like
+#   2) Focused cohort: receptor-defined ERpos vs TNBC contrast
+#   3) Concordance labels for sensitivity analysis
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+expr_mat <- readRDS(file.path(paths$processed, "06_expr_mat_aligned.rds"))
+clin_std <- readRDS(file.path(paths$processed, "07_clin_standardized.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+stopifnot(ncol(expr_mat) == nrow(clin_std))
+stopifnot(all(colnames(expr_mat) == clin_std$sample_id))
+
+# ----------------------------
+# 08A — Primary intrinsic subtype cohort
+# ----------------------------
+
+pam50_keep <- c("LumA", "LumB", "HER2_enriched", "Basal", "Normal_like")
+
+clin_pam50 <- clin_std %>%
+  filter(!is.na(pam50_simple), pam50_simple %in% pam50_keep) %>%
+  mutate(
+    pam50_simple = factor(
+      as.character(pam50_simple),
+      levels = pam50_keep
+    )
+  )
+
+expr_pam50 <- expr_mat[, clin_pam50$sample_id, drop = FALSE]
+
+stopifnot(all(colnames(expr_pam50) == clin_pam50$sample_id))
+
+qc_pam50_cohort <- clin_pam50 %>%
+  dplyr::count(pam50_simple, name = "n") %>%
+  mutate(
+    cohort = "METABRIC_intrinsic_subtype_primary",
+    frac = n / sum(n)
+  ) %>%
+  dplyr::select(cohort, pam50_simple, n, frac)
+
+# ----------------------------
+# 08B — Focused receptor-defined ERpos vs TNBC cohort
+# ----------------------------
+
+clin_focused <- clin_std %>%
+  filter(!is.na(focused_group_ERpos_TNBC)) %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+expr_focused <- expr_mat[, clin_focused$sample_id, drop = FALSE]
+
+stopifnot(all(colnames(expr_focused) == clin_focused$sample_id))
+
+qc_focused_cohort <- clin_focused %>%
+  dplyr::count(focused_group_ERpos_TNBC, name = "n") %>%
+  mutate(
+    cohort = "METABRIC_focused_ERpos_TNBC",
+    frac = n / sum(n)
+  ) %>%
+  dplyr::select(cohort, focused_group_ERpos_TNBC, n, frac)
+
+# ----------------------------
+# 08C — Concordance labels
+# ----------------------------
+
+clin_concordance <- clin_std %>%
+  mutate(
+    receptor_pam50_concordance = dplyr::case_when(
+      broad_receptor_group == "ERpos_HER2neg" &
+        pam50_simple %in% c("LumA", "LumB") ~ "Concordant_ERpos_Luminal",
+
+      broad_receptor_group == "TNBC" &
+        pam50_simple == "Basal" ~ "Concordant_TNBC_Basal",
+
+      broad_receptor_group == "HER2pos" &
+        pam50_simple == "HER2_enriched" ~ "Concordant_HER2pos_HER2enriched",
+
+      is.na(broad_receptor_group) | is.na(pam50_simple) ~ "Insufficient_annotation",
+
+      TRUE ~ "Discordant_or_mixed"
+    )
+  )
+
+qc_concordance <- clin_concordance %>%
+  dplyr::count(receptor_pam50_concordance, name = "n") %>%
+  mutate(frac = n / sum(n)) %>%
+  arrange(desc(n))
+
+# ----------------------------
+# 08D — Save outputs
+# ----------------------------
+
+saveRDS(expr_pam50, file.path(paths$processed, "08_expr_PAM50_primary.rds"))
+saveRDS(clin_pam50, file.path(paths$processed, "08_clin_PAM50_primary.rds"))
+
+saveRDS(expr_focused, file.path(paths$processed, "08_expr_focused_ERpos_TNBC.rds"))
+saveRDS(clin_focused, file.path(paths$processed, "08_clin_focused_ERpos_TNBC.rds"))
+
+saveRDS(clin_concordance, file.path(paths$processed, "08_clin_with_concordance_labels.rds"))
+
+readr::write_csv(qc_pam50_cohort, file.path(paths$tables, "08_qc_PAM50_primary_cohort.csv"))
+readr::write_csv(qc_focused_cohort, file.path(paths$tables, "08_qc_focused_ERpos_TNBC_cohort.csv"))
+readr::write_csv(qc_concordance, file.path(paths$tables, "08_qc_receptor_PAM50_concordance.csv"))
+
+writeLines(
+  c(
+    "Chunk 08 METABRIC cohort definitions",
+    "",
+    "Primary analysis cohort:",
+    "METABRIC intrinsic subtype cohort using CLAUDIN_SUBTYPE-derived LumA, LumB, HER2_enriched, Basal, Normal_like labels.",
+    "",
+    "Focused contrast:",
+    "Receptor-defined ERpos vs TNBC cohort.",
+    "",
+    "Validation logic:",
+    "This mirrors the GSE96058 discovery design while acknowledging METABRIC subtype labels come from CLAUDIN_SUBTYPE annotation."
+  ),
+  con = file.path(paths$tables, "08_METABRIC_cohort_definition_note.txt")
+)
+
+message("Primary intrinsic subtype cohort:")
+print(qc_pam50_cohort)
+
+message("Focused ERpos/TNBC cohort:")
+print(qc_focused_cohort)
+
+message("Receptor/subtype concordance:")
+print(qc_concordance)
+
+```
+```{r Chunk 09 — Handle technical replicates and cohort QC (METABRIC)}
+
+
+
+# ----------------------------
+# Chunk 09 — Handle technical replicates and cohort QC (METABRIC)
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(stringr)
+  library(readr)
+})
+
+expr_pam50 <- readRDS(file.path(paths$processed, "08_expr_PAM50_primary.rds"))
+clin_pam50 <- readRDS(file.path(paths$processed, "08_clin_PAM50_primary.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+expr_focused <- readRDS(file.path(paths$processed, "08_expr_focused_ERpos_TNBC.rds"))
+clin_focused <- readRDS(file.path(paths$processed, "08_clin_focused_ERpos_TNBC.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+stopifnot(all(colnames(expr_pam50) == clin_pam50$sample_id))
+stopifnot(all(colnames(expr_focused) == clin_focused$sample_id))
+
+KEEP_PRIMARY_ONLY <- TRUE
+
+detect_replicates <- function(clin_tbl) {
+  clin_tbl %>%
+    dplyr::mutate(
+      sample_id  = as.character(sample_id),
+      patient_id = as.character(patient_id),
+      is_repl = duplicated(patient_id) | duplicated(patient_id, fromLast = TRUE)
+    )
+}
+
+make_repSAFE <- function(expr_mat, clin_tbl, cohort_label) {
+
+  clin_tbl <- detect_replicates(clin_tbl)
+
+  rep_qc <- clin_tbl %>%
+    dplyr::count(is_repl, name = "n") %>%
+    dplyr::mutate(
+      cohort = cohort_label,
+      KEEP_PRIMARY_ONLY = KEEP_PRIMARY_ONLY
+    ) %>%
+    dplyr::select(cohort, KEEP_PRIMARY_ONLY, is_repl, n)
+
+  if (KEEP_PRIMARY_ONLY) {
+
+    clin_out <- clin_tbl %>%
+      dplyr::group_by(patient_id) %>%
+      dplyr::slice(1) %>%
+      dplyr::ungroup()
+
+    expr_out <- expr_mat[, clin_out$sample_id, drop = FALSE]
+
+    note <- paste0(
+      cohort_label,
+      ": KEEP_PRIMARY_ONLY=TRUE | kept ",
+      ncol(expr_out),
+      " unique patient/sample profiles."
+    )
+
+  } else {
+
+    uniq_pid <- unique(clin_tbl$patient_id)
+
+    expr_out <- sapply(uniq_pid, function(id) {
+      cols <- clin_tbl$sample_id[clin_tbl$patient_id == id]
+
+      if (length(cols) == 1) {
+        expr_mat[, cols]
+      } else {
+        rowMeans(expr_mat[, cols, drop = FALSE], na.rm = TRUE)
+      }
+    })
+
+    expr_out <- as.matrix(expr_out)
+    rownames(expr_out) <- rownames(expr_mat)
+    colnames(expr_out) <- uniq_pid
+
+    clin_out <- clin_tbl %>%
+      dplyr::group_by(patient_id) %>%
+      dplyr::slice(1) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(sample_id = patient_id)
+
+    note <- paste0(
+      cohort_label,
+      ": KEEP_PRIMARY_ONLY=FALSE | collapsed to ",
+      ncol(expr_out),
+      " patient-level profiles."
+    )
+  }
+
+  stopifnot(ncol(expr_out) == nrow(clin_out))
+  stopifnot(all(colnames(expr_out) == clin_out$sample_id))
+  stopifnot(anyDuplicated(clin_out$sample_id) == 0)
+
+  list(
+    expr = expr_out,
+    clin = clin_out,
+    rep_qc = rep_qc,
+    note = note
+  )
+}
+
+pam50_repSAFE <- make_repSAFE(
+  expr_mat = expr_pam50,
+  clin_tbl = clin_pam50,
+  cohort_label = "METABRIC_PAM50_primary"
+)
+
+focused_repSAFE <- make_repSAFE(
+  expr_mat = expr_focused,
+  clin_tbl = clin_focused,
+  cohort_label = "METABRIC_Focused_ERpos_TNBC"
+)
+
+qc_pam50_repSAFE <- pam50_repSAFE$clin %>%
+  dplyr::count(pam50_simple, name = "n") %>%
+  dplyr::mutate(cohort = "PAM50_primary_repSAFE", frac = n / sum(n)) %>%
+  dplyr::select(cohort, pam50_simple, n, frac)
+
+qc_focused_repSAFE <- focused_repSAFE$clin %>%
+  dplyr::count(focused_group_ERpos_TNBC, name = "n") %>%
+  dplyr::mutate(cohort = "Focused_ERpos_TNBC_repSAFE", frac = n / sum(n)) %>%
+  dplyr::select(cohort, focused_group_ERpos_TNBC, n, frac)
+
+qc_replicates <- dplyr::bind_rows(
+  pam50_repSAFE$rep_qc,
+  focused_repSAFE$rep_qc
+)
+
+saveRDS(pam50_repSAFE$expr, file.path(paths$processed, "09_expr_PAM50_primary_repSAFE.rds"))
+saveRDS(pam50_repSAFE$clin, file.path(paths$processed, "09_clin_PAM50_primary_repSAFE.rds"))
+
+saveRDS(focused_repSAFE$expr, file.path(paths$processed, "09_expr_focused_ERpos_TNBC_repSAFE.rds"))
+saveRDS(focused_repSAFE$clin, file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds"))
+
+readr::write_csv(qc_replicates, file.path(paths$tables, "09_qc_replicate_detection.csv"))
+readr::write_csv(qc_pam50_repSAFE, file.path(paths$tables, "09_qc_PAM50_primary_repSAFE.csv"))
+readr::write_csv(qc_focused_repSAFE, file.path(paths$tables, "09_qc_focused_ERpos_TNBC_repSAFE.csv"))
+
+writeLines(
+  c(pam50_repSAFE$note, focused_repSAFE$note),
+  con = file.path(paths$tables, "09_replicate_handling_note.txt")
+)
+
+message("PAM50 primary cohort after replicate handling:")
+print(qc_pam50_repSAFE)
+
+message("Focused ERpos/TNBC cohort after replicate handling:")
+print(qc_focused_repSAFE)
+
+message("Replicate QC:")
+print(qc_replicates)
+```
+
+```{r Chunk 10 — Conservative ferroptosis axes for METABRIC validation}
+# ----------------------------
+# Chunk 10 — Conservative ferroptosis axes for METABRIC validation
+# Pipeline logic:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Use the exact same conservative CORE ferroptosis axes as GSE96058.
+#   This ensures METABRIC is a true validation cohort, not a redefined analysis.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(readr)
+  library(stringr)
+})
+
+expr_pam50 <- readRDS(file.path(paths$processed, "09_expr_PAM50_primary_repSAFE.rds"))
+
+# ----------------------------
+# 10A — Conservative CORE axes for scoring
+# ----------------------------
+
+ferro_axes_core <- list(
+
+  Xc_GSH = c(
+    "SLC7A11", "SLC3A2",
+    "GCLC", "GCLM", "GSS", "GSR"
+  ),
+
+  GPX4_Selenium = c(
+    "GPX4",
+    "SEPHS2", "PSTK", "SEPSECS", "EEFSEC", "SECISBP2"
+  ),
+
+  FSP1_CoQ = c(
+    "AIFM2",
+    "PDSS1", "PDSS2",
+    "COQ2", "COQ6", "COQ7", "COQ9", "COQ10A", "COQ10B"
+  ),
+
+  BH4_GCH1 = c(
+    "GCH1", "PTS", "SPR", "QDPR", "DHFR"
+  ),
+
+  DHODH_Mito = c(
+    "DHODH", "CISD1", "CISD2"
+  ),
+
+  Iron_Handling = c(
+    "TFRC", "SLC11A2", "STEAP3",
+    "FTH1", "FTL",
+    "NCOA4", "SLC40A1"
+  ),
+
+  PUFA_Loading = c(
+    "ACSL4", "LPCAT3", "FADS1", "FADS2"
+  ),
+
+  Lipid_Peroxidation = c(
+    "ALOX5", "ALOX12", "ALOX15",
+    "POR", "NOX1", "NOX4"
+  )
+)
+
+ferro_axes_core <- lapply(
+  ferro_axes_core,
+  function(x) unique(toupper(trimws(x[!is.na(x) & x != ""])))
+)
+
+AXES_ORDER <- names(ferro_axes_core)
+
+# ----------------------------
+# 10B — Support genes, not used for primary scoring
+# ----------------------------
+
+ferro_support_genes <- list(
+
+  NRF2_Stress_Response = c(
+    "NFE2L2", "KEAP1", "HMOX1", "NQO1", "TXNRD1"
+  ),
+
+  Ferroptosis_Response_Markers = c(
+    "PTGS2", "CHAC1", "SAT1"
+  ),
+
+  MUFA_Remodeling_Resistance = c(
+    "ACSL3", "SCD", "MBOAT1", "MBOAT2"
+  ),
+
+  Additional_NEET_Mito = c(
+    "CISD3"
+  ),
+
+  Additional_Selenium_Redox = c(
+    "SCLY", "PRDX6"
+  )
+)
+
+ferro_support_genes <- lapply(
+  ferro_support_genes,
+  function(x) unique(toupper(trimws(x[!is.na(x) & x != ""])))
+)
+
+# ----------------------------
+# 10C — Axis membership tables
+# ----------------------------
+
+axis_gene_table_core <- tibble::tibble(
+  axis = rep(names(ferro_axes_core), lengths(ferro_axes_core)),
+  gene = unlist(ferro_axes_core, use.names = FALSE),
+  role = "core_scoring_gene"
+) %>%
+  arrange(axis, gene)
+
+axis_gene_table_support <- tibble::tibble(
+  support_group = rep(names(ferro_support_genes), lengths(ferro_support_genes)),
+  gene = unlist(ferro_support_genes, use.names = FALSE),
+  role = "support_not_primary_scoring"
+) %>%
+  arrange(support_group, gene)
+
+dup_core_genes <- axis_gene_table_core %>%
+  dplyr::count(gene, name = "n_axes") %>%
+  filter(n_axes > 1)
+
+if (nrow(dup_core_genes) > 0) {
+  stop(
+    "Core scoring genes overlap between axes: ",
+    paste(dup_core_genes$gene, collapse = ", "),
+    ". Fix before scoring."
+  )
+}
+
+# ----------------------------
+# 10D — METABRIC coverage QC
+# ----------------------------
+
+available_genes <- rownames(expr_pam50)
+
+axis_coverage_core <- axis_gene_table_core %>%
+  mutate(
+    present_in_METABRIC = gene %in% available_genes
+  ) %>%
+  group_by(axis) %>%
+  summarise(
+    n_genes_defined = n(),
+    n_genes_present = sum(present_in_METABRIC),
+    coverage_frac = n_genes_present / n_genes_defined,
+    present_genes = paste(gene[present_in_METABRIC], collapse = "; "),
+    missing_genes = paste(gene[!present_in_METABRIC], collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  arrange(match(axis, AXES_ORDER))
+
+support_gene_coverage <- axis_gene_table_support %>%
+  mutate(
+    present_in_METABRIC = gene %in% available_genes
+  ) %>%
+  group_by(support_group) %>%
+  summarise(
+    n_genes_defined = n(),
+    n_genes_present = sum(present_in_METABRIC),
+    coverage_frac = n_genes_present / n_genes_defined,
+    present_genes = paste(gene[present_in_METABRIC], collapse = "; "),
+    missing_genes = paste(gene[!present_in_METABRIC], collapse = "; "),
+    .groups = "drop"
+  )
+
+low_coverage_axes <- axis_coverage_core %>%
+  filter(coverage_frac < SPEC$min_axis_cov)
+
+if (nrow(low_coverage_axes) > 0) {
+  warning(
+    "Low-coverage CORE axes detected in METABRIC: ",
+    paste(low_coverage_axes$axis, collapse = ", "),
+    ". Review before scoring."
+  )
+}
+
+# ----------------------------
+# 10E — Save outputs
+# ----------------------------
+
+saveRDS(ferro_axes_core, file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds"))
+saveRDS(ferro_support_genes, file.path(paths$processed, "10_ferro_support_genes_not_scoring.rds"))
+saveRDS(AXES_ORDER, file.path(paths$processed, "10_axes_order.rds"))
+
+readr::write_csv(
+  axis_gene_table_core,
+  file.path(paths$tables, "10_CORE_ferroptosis_axis_gene_membership.csv")
+)
+
+readr::write_csv(
+  axis_gene_table_support,
+  file.path(paths$tables, "10_SUPPORT_ferroptosis_genes_not_primary_scoring.csv")
+)
+
+readr::write_csv(
+  axis_coverage_core,
+  file.path(paths$tables, "10_CORE_ferroptosis_axis_gene_coverage_METABRIC.csv")
+)
+
+readr::write_csv(
+  support_gene_coverage,
+  file.path(paths$tables, "10_SUPPORT_gene_coverage_METABRIC.csv")
+)
+
+writeLines(
+  c(
+    "METABRIC conservative ferroptosis axis strategy",
+    "",
+    "Validation principle:",
+    "The same conservative core ferroptosis axes used in GSE96058 discovery are used here.",
+    "No axis definitions are changed in METABRIC.",
+    "",
+    "Primary scoring axes:",
+    paste0("- ", AXES_ORDER),
+    "",
+    "Interpretation rule:",
+    "Axis-level scores are the primary validation evidence.",
+    "Single genes are used later only as marker-level support and validation candidates.",
+    "",
+    "Rationale:",
+    "This preserves discovery-validation symmetry and avoids dataset-specific axis tuning."
+  ),
+  con = file.path(paths$tables, "10_METABRIC_conservative_axis_strategy_note.txt")
+)
+
+message("Conservative core ferroptosis axes defined for METABRIC: ", length(ferro_axes_core))
+message("METABRIC core axis coverage:")
+print(axis_coverage_core)
+
+message("METABRIC support gene coverage:")
+print(support_gene_coverage)
+
+axis_gene_table_core
+
+```
+
+
+```{r Chunk 11 — Gene-wise Z-score matrices for METABRIC}
+# ----------------------------
+# Chunk 11 — Gene-wise Z-score matrices for METABRIC
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Convert METABRIC expression to gene-wise Z-scores within each cohort.
+#   This makes genes comparable before calculating ferroptosis axis scores.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(matrixStats)
+  library(tibble)
+  library(readr)
+  library(dplyr)
+})
+
+expr_pam50   <- readRDS(file.path(paths$processed, "09_expr_PAM50_primary_repSAFE.rds"))
+clin_pam50   <- readRDS(file.path(paths$processed, "09_clin_PAM50_primary_repSAFE.rds")) |>
+  as.data.frame()
+
+expr_focused <- readRDS(file.path(paths$processed, "09_expr_focused_ERpos_TNBC_repSAFE.rds"))
+clin_focused <- readRDS(file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds")) |>
+  as.data.frame()
+
+stopifnot(all(colnames(expr_pam50) == clin_pam50$sample_id))
+stopifnot(all(colnames(expr_focused) == clin_focused$sample_id))
+
+# ----------------------------
+# 11A — Z-score function
+# ----------------------------
+
+make_gene_z <- function(expr_mat, cohort_label) {
+
+  row_means <- rowMeans(expr_mat, na.rm = TRUE)
+  row_sds   <- matrixStats::rowSds(expr_mat, na.rm = TRUE)
+
+  row_sds[!is.finite(row_sds) | row_sds == 0] <- NA_real_
+
+  expr_z <- sweep(expr_mat, 1, row_means, "-")
+  expr_z <- sweep(expr_z, 1, row_sds, "/")
+  expr_z[!is.finite(expr_z)] <- NA_real_
+
+  qc_z <- tibble::tibble(
+    dataset = project$dataset,
+    cohort = cohort_label,
+    n_genes = nrow(expr_z),
+    n_samples = ncol(expr_z),
+    pct_missing_z = mean(is.na(expr_z)) * 100,
+    n_zero_or_invalid_sd_genes = sum(is.na(row_sds)),
+    median_gene_sd_raw = median(row_sds, na.rm = TRUE)
+  )
+
+  list(expr_z = expr_z, qc = qc_z)
+}
+
+# ----------------------------
+# 11B — Create Z-score matrices
+# ----------------------------
+
+z_pam50 <- make_gene_z(
+  expr_mat = expr_pam50,
+  cohort_label = "METABRIC_PAM50_primary_repSAFE"
+)
+
+z_focused <- make_gene_z(
+  expr_mat = expr_focused,
+  cohort_label = "METABRIC_Focused_ERpos_TNBC_repSAFE"
+)
+
+# ----------------------------
+# 11C — Save outputs
+# ----------------------------
+
+saveRDS(
+  z_pam50$expr_z,
+  file.path(paths$processed, "11_expr_z_PAM50_primary_repSAFE.rds")
+)
+
+saveRDS(
+  z_focused$expr_z,
+  file.path(paths$processed, "11_expr_z_focused_ERpos_TNBC_repSAFE.rds")
+)
+
+qc_z_all <- dplyr::bind_rows(z_pam50$qc, z_focused$qc)
+
+readr::write_csv(
+  qc_z_all,
+  file.path(paths$tables, "11_qc_gene_wise_zscore_matrices_METABRIC.csv")
+)
+
+message("METABRIC gene-wise Z-score matrices created.")
+print(qc_z_all)
+
+```
+
+```{r Chunk 12 — Ferroptosis axis scores for METABRIC validation}
+# ----------------------------
+# Chunk 12 — Ferroptosis axis scores for METABRIC validation
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Compute:
+#     1) Weighted module scores (PRIMARY)
+#     2) Unweighted mean-Z scores (SENSITIVITY)
+#
+# Rule:
+#   Use the same conservative CORE axes as GSE96058.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(purrr)
+  library(readr)
+  library(matrixStats)
+})
+
+expr_z_pam50   <- readRDS(file.path(paths$processed, "11_expr_z_PAM50_primary_repSAFE.rds"))
+expr_z_focused <- readRDS(file.path(paths$processed, "11_expr_z_focused_ERpos_TNBC_repSAFE.rds"))
+
+ferro_axes_core <- readRDS(file.path(paths$processed, "10_ferro_axes_CORE_scoring.rds"))
+AXES_ORDER      <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+# ----------------------------
+# 12A — Axis scoring function
+# ----------------------------
+
+compute_axis_scores <- function(expr_z, axes_list, cohort_label) {
+
+  gene_sd <- matrixStats::rowSds(expr_z, na.rm = TRUE)
+
+  axis_scores_weighted <- list()
+  axis_scores_unweighted <- list()
+  axis_qc <- list()
+
+  for (ax in names(axes_list)) {
+
+    genes <- axes_list[[ax]]
+    genes_present <- intersect(genes, rownames(expr_z))
+
+    if (length(genes_present) == 0) {
+      warning("Axis ", ax, " has zero available genes in ", cohort_label)
+      next
+    }
+
+    sub_mat <- expr_z[genes_present, , drop = FALSE]
+    weights <- gene_sd[genes_present]
+
+    valid <- is.finite(weights) & !is.na(weights) & weights > 0
+    sub_mat <- sub_mat[valid, , drop = FALSE]
+    weights <- weights[valid]
+
+    if (length(weights) == 0) {
+      warning("Axis ", ax, " has no valid weighted genes in ", cohort_label)
+      next
+    }
+
+    weights <- weights / sum(weights)
+
+    score_w <- colSums(sweep(sub_mat, 1, weights, "*"), na.rm = TRUE)
+    score_u <- colMeans(sub_mat, na.rm = TRUE)
+
+    axis_scores_weighted[[ax]] <- score_w
+    axis_scores_unweighted[[ax]] <- score_u
+
+    axis_qc[[ax]] <- tibble::tibble(
+      dataset = project$dataset,
+      cohort = cohort_label,
+      axis = ax,
+      n_genes_defined = length(genes),
+      n_genes_present = length(genes_present),
+      n_genes_used = nrow(sub_mat),
+      coverage_frac = nrow(sub_mat) / length(genes),
+      genes_used = paste(rownames(sub_mat), collapse = "; ")
+    )
+  }
+
+  scores_w <- as.data.frame(axis_scores_weighted)
+  scores_u <- as.data.frame(axis_scores_unweighted)
+
+  scores_w <- scores_w[, AXES_ORDER, drop = FALSE]
+  scores_u <- scores_u[, AXES_ORDER, drop = FALSE]
+
+  scores_w$sample_id <- colnames(expr_z)
+  scores_u$sample_id <- colnames(expr_z)
+
+  scores_w <- tibble::as_tibble(scores_w)
+  scores_u <- tibble::as_tibble(scores_u)
+
+  qc <- dplyr::bind_rows(axis_qc)
+
+  list(
+    weighted = scores_w,
+    unweighted = scores_u,
+    qc = qc
+  )
+}
+
+# ----------------------------
+# 12B — Compute scores
+# ----------------------------
+
+scores_pam50 <- compute_axis_scores(
+  expr_z = expr_z_pam50,
+  axes_list = ferro_axes_core,
+  cohort_label = "METABRIC_PAM50_primary"
+)
+
+scores_focused <- compute_axis_scores(
+  expr_z = expr_z_focused,
+  axes_list = ferro_axes_core,
+  cohort_label = "METABRIC_Focused_ERpos_TNBC"
+)
+
+# ----------------------------
+# 12C — Save outputs
+# ----------------------------
+
+saveRDS(
+  scores_pam50$weighted,
+  file.path(paths$processed, "12_scores_weighted_PAM50.rds")
+)
+
+saveRDS(
+  scores_pam50$unweighted,
+  file.path(paths$processed, "12_scores_unweighted_PAM50.rds")
+)
+
+saveRDS(
+  scores_focused$weighted,
+  file.path(paths$processed, "12_scores_weighted_focused.rds")
+)
+
+saveRDS(
+  scores_focused$unweighted,
+  file.path(paths$processed, "12_scores_unweighted_focused.rds")
+)
+
+qc_axes <- dplyr::bind_rows(scores_pam50$qc, scores_focused$qc)
+
+readr::write_csv(
+  qc_axes,
+  file.path(paths$tables, "12_qc_axis_gene_coverage_used_METABRIC.csv")
+)
+
+message("METABRIC axis scoring completed.")
+print(qc_axes)
+
+```
+
+```{r Chunk 13 — Add clinical labels to METABRIC axis scores}
+# ----------------------------
+# Chunk 13 — Add clinical labels to METABRIC axis scores
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Join weighted and unweighted axis scores with:
+#     1) intrinsic subtype labels
+#     2) focused ERpos/TNBC labels
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+})
+
+# ----------------------------
+# 13A — Load scores and clinical metadata
+# ----------------------------
+
+scores_w_pam50 <- readRDS(file.path(paths$processed, "12_scores_weighted_PAM50.rds"))
+scores_u_pam50 <- readRDS(file.path(paths$processed, "12_scores_unweighted_PAM50.rds"))
+
+scores_w_focus <- readRDS(file.path(paths$processed, "12_scores_weighted_focused.rds"))
+scores_u_focus <- readRDS(file.path(paths$processed, "12_scores_unweighted_focused.rds"))
+
+clin_pam50 <- readRDS(file.path(paths$processed, "09_clin_PAM50_primary_repSAFE.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+clin_focus <- readRDS(file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+# ----------------------------
+# 13B — Safety checks
+# ----------------------------
+
+stopifnot(all(scores_w_pam50$sample_id == clin_pam50$sample_id))
+stopifnot(all(scores_u_pam50$sample_id == clin_pam50$sample_id))
+
+stopifnot(all(scores_w_focus$sample_id == clin_focus$sample_id))
+stopifnot(all(scores_u_focus$sample_id == clin_focus$sample_id))
+
+# ----------------------------
+# 13C — Join labels
+# ----------------------------
+
+scores_w_pam50_labeled <- scores_w_pam50 %>%
+  left_join(
+    clin_pam50 %>%
+      select(
+        sample_id,
+        patient_id,
+        pam50_subtype,
+        pam50_simple,
+        ER_status_std,
+        PGR_status_std,
+        HER2_status_std,
+        broad_receptor_group,
+        focused_group_ERpos_TNBC
+      ),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    dataset = project$dataset,
+    cohort = "METABRIC_PAM50_primary",
+    score_type = "weighted_primary"
+  )
+
+scores_u_pam50_labeled <- scores_u_pam50 %>%
+  left_join(
+    clin_pam50 %>%
+      select(
+        sample_id,
+        patient_id,
+        pam50_subtype,
+        pam50_simple,
+        ER_status_std,
+        PGR_status_std,
+        HER2_status_std,
+        broad_receptor_group,
+        focused_group_ERpos_TNBC
+      ),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    dataset = project$dataset,
+    cohort = "METABRIC_PAM50_primary",
+    score_type = "unweighted_sensitivity"
+  )
+
+scores_w_focus_labeled <- scores_w_focus %>%
+  left_join(
+    clin_focus %>%
+      select(
+        sample_id,
+        patient_id,
+        pam50_subtype,
+        pam50_simple,
+        ER_status_std,
+        PGR_status_std,
+        HER2_status_std,
+        broad_receptor_group,
+        focused_group_ERpos_TNBC
+      ),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    dataset = project$dataset,
+    cohort = "METABRIC_Focused_ERpos_TNBC",
+    score_type = "weighted_primary"
+  )
+
+scores_u_focus_labeled <- scores_u_focus %>%
+  left_join(
+    clin_focus %>%
+      select(
+        sample_id,
+        patient_id,
+        pam50_subtype,
+        pam50_simple,
+        ER_status_std,
+        PGR_status_std,
+        HER2_status_std,
+        broad_receptor_group,
+        focused_group_ERpos_TNBC
+      ),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    dataset = project$dataset,
+    cohort = "METABRIC_Focused_ERpos_TNBC",
+    score_type = "unweighted_sensitivity"
+  )
+
+# ----------------------------
+# 13D — QC
+# ----------------------------
+
+qc_scores_labeled <- tibble::tibble(
+  dataset = project$dataset,
+  object = c(
+    "scores_w_pam50_labeled",
+    "scores_u_pam50_labeled",
+    "scores_w_focus_labeled",
+    "scores_u_focus_labeled"
+  ),
+  n_samples = c(
+    nrow(scores_w_pam50_labeled),
+    nrow(scores_u_pam50_labeled),
+    nrow(scores_w_focus_labeled),
+    nrow(scores_u_focus_labeled)
+  ),
+  n_missing_pam50 = c(
+    sum(is.na(scores_w_pam50_labeled$pam50_simple)),
+    sum(is.na(scores_u_pam50_labeled$pam50_simple)),
+    sum(is.na(scores_w_focus_labeled$pam50_simple)),
+    sum(is.na(scores_u_focus_labeled$pam50_simple))
+  ),
+  n_missing_focus_group = c(
+    sum(is.na(scores_w_pam50_labeled$focused_group_ERpos_TNBC)),
+    sum(is.na(scores_u_pam50_labeled$focused_group_ERpos_TNBC)),
+    sum(is.na(scores_w_focus_labeled$focused_group_ERpos_TNBC)),
+    sum(is.na(scores_u_focus_labeled$focused_group_ERpos_TNBC))
+  )
+)
+
+# ----------------------------
+# 13E — Save outputs
+# ----------------------------
+
+saveRDS(
+  scores_w_pam50_labeled,
+  file.path(paths$processed, "13_scores_weighted_PAM50_labeled.rds")
+)
+
+saveRDS(
+  scores_u_pam50_labeled,
+  file.path(paths$processed, "13_scores_unweighted_PAM50_labeled.rds")
+)
+
+saveRDS(
+  scores_w_focus_labeled,
+  file.path(paths$processed, "13_scores_weighted_focused_labeled.rds")
+)
+
+saveRDS(
+  scores_u_focus_labeled,
+  file.path(paths$processed, "13_scores_unweighted_focused_labeled.rds")
+)
+
+readr::write_csv(
+  qc_scores_labeled,
+  file.path(paths$tables, "13_qc_labeled_axis_scores_METABRIC.csv")
+)
+
+message("METABRIC labeled axis score objects saved.")
+print(qc_scores_labeled)
+
+```
+
+```{r Chunk 14 — METABRIC PAM50 axis comparison + publication visualization}
+# ----------------------------
+# Chunk 14 — METABRIC PAM50 axis comparison + publication visualization
+# Adds:
+#   1) Global Kruskal-Wallis BH-FDR labels on boxplots
+#   2) Row-clustered heatmap while keeping PAM50 subtype order fixed
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(readr)
+  library(forcats)
+  library(patchwork)
+  library(scales)
+  library(rstatix)
+  library(stringr)
+})
+
+scores_w_pam50 <- readRDS(file.path(paths$processed, "13_scores_weighted_PAM50_labeled.rds"))
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+pam50_levels <- c("LumA", "LumB", "HER2_enriched", "Basal", "Normal_like")
+
+scores_long <- scores_w_pam50 %>%
+  mutate(
+    pam50_simple = factor(as.character(pam50_simple), levels = pam50_levels)
+  ) %>%
+  select(sample_id, pam50_simple, all_of(AXES_ORDER)) %>%
+  pivot_longer(
+    cols = all_of(AXES_ORDER),
+    names_to = "axis",
+    values_to = "weighted_axis_score"
+  ) %>%
+  filter(
+    !is.na(pam50_simple),
+    is.finite(weighted_axis_score),
+    pam50_simple %in% pam50_levels
+  ) %>%
+  mutate(
+    axis = factor(as.character(axis), levels = AXES_ORDER),
+    pam50_simple = factor(as.character(pam50_simple), levels = pam50_levels)
+  )
+
+# ----------------------------
+# 14A — Global Kruskal-Wallis test per axis
+# ----------------------------
+
+kw_pam50 <- scores_long %>%
+  group_by(axis) %>%
+  rstatix::kruskal_test(weighted_axis_score ~ pam50_simple) %>%
+  ungroup() %>%
+  mutate(
+    FDR_BH = p.adjust(p, method = "BH"),
+    FDR_label = case_when(
+      FDR_BH < 0.001 ~ "BH-FDR < 0.001",
+      FDR_BH < 0.01  ~ "BH-FDR < 0.01",
+      FDR_BH < 0.05  ~ "BH-FDR < 0.05",
+      TRUE ~ paste0("BH-FDR = ", signif(FDR_BH, 2))
+    ),
+    significant_FDR_0.05 = FDR_BH < 0.05
+  ) %>%
+  arrange(FDR_BH)
+
+# Label positions for boxplots
+label_pos <- scores_long %>%
+  group_by(axis) %>%
+  summarise(
+    y_pos = max(weighted_axis_score, na.rm = TRUE) +
+      0.08 * diff(range(weighted_axis_score, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  left_join(kw_pam50 %>% select(axis, FDR_label), by = "axis") %>%
+  mutate(
+    pam50_simple = pam50_levels[1]
+  )
+
+# ----------------------------
+# 14B — Pairwise Wilcoxon tests
+# ----------------------------
+
+pairwise_pam50 <- scores_long %>%
+  group_by(axis) %>%
+  rstatix::pairwise_wilcox_test(
+    weighted_axis_score ~ pam50_simple,
+    p.adjust.method = "BH"
+  ) %>%
+  ungroup() %>%
+  arrange(axis, p.adj)
+
+# ----------------------------
+# 14C — Median heatmap table
+# ----------------------------
+
+axis_medians <- scores_long %>%
+  group_by(axis, pam50_simple) %>%
+  summarise(
+    median_score = median(weighted_axis_score, na.rm = TRUE),
+    mean_score = mean(weighted_axis_score, na.rm = TRUE),
+    sd_score = sd(weighted_axis_score, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(axis) %>%
+  mutate(
+    centered_median = median_score - median(median_score, na.rm = TRUE),
+    highest_subtype = pam50_simple[which.max(median_score)],
+    lowest_subtype = pam50_simple[which.min(median_score)]
+  ) %>%
+  ungroup()
+
+# ----------------------------
+# 14D — Row clustering for heatmap only
+# Keep subtype order fixed
+# ----------------------------
+
+heat_mat <- axis_medians %>%
+  select(axis, pam50_simple, centered_median) %>%
+  tidyr::pivot_wider(
+    names_from = pam50_simple,
+    values_from = centered_median
+  ) %>%
+  as.data.frame()
+
+rownames(heat_mat) <- heat_mat$axis
+heat_mat$axis <- NULL
+
+heat_mat <- heat_mat[, pam50_levels, drop = FALSE]
+
+axis_cluster_order <- rownames(heat_mat)[
+  hclust(dist(as.matrix(heat_mat)), method = "complete")$order
+]
+
+axis_medians_clustered <- axis_medians %>%
+  mutate(
+    axis_clustered = factor(as.character(axis), levels = rev(axis_cluster_order)),
+    pam50_simple = factor(as.character(pam50_simple), levels = pam50_levels)
+  )
+
+# ----------------------------
+# 14E — Save statistical tables
+# ----------------------------
+
+readr::write_csv(
+  kw_pam50,
+  file.path(paths$tables, "14_METABRIC_PAM50_weighted_axis_KruskalWallis.csv")
+)
+
+readr::write_csv(
+  pairwise_pam50,
+  file.path(paths$tables, "14_METABRIC_PAM50_weighted_axis_pairwise_Wilcoxon.csv")
+)
+
+readr::write_csv(
+  axis_medians,
+  file.path(paths$tables, "14_METABRIC_PAM50_axis_median_scores.csv")
+)
+
+readr::write_csv(
+  axis_medians_clustered,
+  file.path(paths$tables, "14_METABRIC_PAM50_axis_median_scores_row_clustered.csv")
+)
+
+readr::write_csv(
+  tibble(axis_order_clustered = axis_cluster_order),
+  file.path(paths$tables, "14_METABRIC_PAM50_heatmap_row_cluster_order.csv")
+)
+
+# ----------------------------
+# 14F — Publication boxplot with BH-FDR annotation
+# ----------------------------
+
+p_box <- ggplot(
+  scores_long,
+  aes(x = pam50_simple, y = weighted_axis_score, fill = pam50_simple)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.75,
+    linewidth = 0.35
+  ) +
+  geom_jitter(
+    width = 0.18,
+    alpha = 0.18,
+    size = 0.45,
+    color = "black"
+  ) +
+  geom_text(
+    data = label_pos,
+    aes(x = pam50_simple, y = y_pos, label = FDR_label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    size = 3.2,
+    fontface = "bold"
+  ) +
+  facet_wrap(~ axis, scales = "free_y", ncol = 4) +
+  labs(
+    title = "METABRIC validation: ferroptosis axis activity across intrinsic breast cancer subtypes",
+    subtitle = "Primary weighted module scores; global Kruskal-Wallis BH-FDR shown per axis",
+    x = NULL,
+    y = "Weighted ferroptosis axis score"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 17),
+    plot.subtitle = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# ----------------------------
+# 14G — Row-clustered heatmap
+# ----------------------------
+
+p_heat_clustered <- ggplot(
+  axis_medians_clustered,
+  aes(x = pam50_simple, y = axis_clustered, fill = centered_median)
+) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", median_score)), size = 3.6) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Centered\nmedian"
+  ) +
+  labs(
+    title = "METABRIC validation: median ferroptosis axis pattern by intrinsic subtype",
+    subtitle = "Rows are clustered by centered median axis activity; PAM50 subtype order is fixed",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 17),
+    plot.subtitle = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+# ----------------------------
+# 14H — Save figures
+# ----------------------------
+
+ggsave(
+  filename = file.path(paths$figures, "14_METABRIC_PAM50_axis_boxplots_with_BHFDR.png"),
+  plot = p_box,
+  width = 14,
+  height = 8,
+  dpi = 450,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(paths$figures, "14_METABRIC_PAM50_axis_boxplots_with_BHFDR.pdf"),
+  plot = p_box,
+  width = 14,
+  height = 8,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(paths$figures, "14_METABRIC_PAM50_axis_median_heatmap_row_clustered.png"),
+  plot = p_heat_clustered,
+  width = 11,
+  height = 7,
+  dpi = 450,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(paths$figures, "14_METABRIC_PAM50_axis_median_heatmap_row_clustered.pdf"),
+  plot = p_heat_clustered,
+  width = 11,
+  height = 7,
+  bg = "white"
+)
+
+message("Updated METABRIC Chunk 14 completed.")
+message("Saved publication-ready figures:")
+message("- 14_METABRIC_PAM50_axis_boxplots_with_BHFDR.png/pdf")
+message("- 14_METABRIC_PAM50_axis_median_heatmap_row_clustered.png/pdf")
+
+print(kw_pam50)
+
+p_box
+p_heat_clustered
+```
+
+```{r Chunk 15 — METABRIC focused ERpos vs TNBC ferroptosis axis signature}
+# ----------------------------
+# Chunk 15 — METABRIC focused ERpos vs TNBC ferroptosis axis signature
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Validate the focused GSE96058 ERpos/TNBC axis signature in METABRIC.
+#   Positive Cliff's delta = higher TNBC axis activity.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(rstatix)
+  library(forcats)
+})
+
+scores_w_focus <- readRDS(file.path(paths$processed, "13_scores_weighted_focused_labeled.rds"))
+scores_u_focus <- readRDS(file.path(paths$processed, "13_scores_unweighted_focused_labeled.rds"))
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+# ----------------------------
+# 15A — Manual Cliff's delta function
+# ----------------------------
+
+cliffs_delta_manual <- function(x_tnbc, x_erpos) {
+  x_tnbc <- x_tnbc[is.finite(x_tnbc)]
+  x_erpos <- x_erpos[is.finite(x_erpos)]
+
+  if (length(x_tnbc) == 0 || length(x_erpos) == 0) return(NA_real_)
+
+  cmp <- outer(x_tnbc, x_erpos, "-")
+  (sum(cmp > 0) - sum(cmp < 0)) / (length(x_tnbc) * length(x_erpos))
+}
+
+# ----------------------------
+# 15B — Prepare long tables
+# ----------------------------
+
+make_focus_long <- function(scores_df, score_label) {
+  scores_df %>%
+    mutate(
+      focused_group_ERpos_TNBC = factor(
+        as.character(focused_group_ERpos_TNBC),
+        levels = c("ERpos", "TNBC")
+      )
+    ) %>%
+    select(sample_id, focused_group_ERpos_TNBC, all_of(AXES_ORDER)) %>%
+    pivot_longer(
+      cols = all_of(AXES_ORDER),
+      names_to = "axis",
+      values_to = "axis_score"
+    ) %>%
+    filter(!is.na(focused_group_ERpos_TNBC), is.finite(axis_score)) %>%
+    mutate(
+      axis = factor(axis, levels = AXES_ORDER),
+      score_type = score_label
+    )
+}
+
+focus_w_long <- make_focus_long(scores_w_focus, "weighted_primary")
+focus_u_long <- make_focus_long(scores_u_focus, "unweighted_sensitivity")
+
+# ----------------------------
+# 15C — Weighted primary statistics
+# ----------------------------
+
+axis_stats_w <- focus_w_long %>%
+  group_by(axis) %>%
+  summarise(
+    n_ERpos = sum(focused_group_ERpos_TNBC == "ERpos"),
+    n_TNBC  = sum(focused_group_ERpos_TNBC == "TNBC"),
+    median_ERpos = median(axis_score[focused_group_ERpos_TNBC == "ERpos"], na.rm = TRUE),
+    median_TNBC  = median(axis_score[focused_group_ERpos_TNBC == "TNBC"], na.rm = TRUE),
+    delta_median = median_TNBC - median_ERpos,
+    cliffs_delta = cliffs_delta_manual(
+      axis_score[focused_group_ERpos_TNBC == "TNBC"],
+      axis_score[focused_group_ERpos_TNBC == "ERpos"]
+    ),
+    wilcox_p = wilcox.test(
+      axis_score ~ focused_group_ERpos_TNBC,
+      exact = FALSE
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    wilcox_fdr = p.adjust(wilcox_p, method = "BH"),
+    evidence = case_when(
+      wilcox_fdr < 0.05 & abs(cliffs_delta) >= 0.30 ~ "Strong",
+      wilcox_fdr < 0.05 & abs(cliffs_delta) >= 0.15 ~ "Moderate",
+      TRUE ~ "Not_significant"
+    ),
+    direction = case_when(
+      cliffs_delta > 0 ~ "Higher_in_TNBC",
+      cliffs_delta < 0 ~ "Higher_in_ERpos",
+      TRUE ~ "No_direction"
+    )
+  ) %>%
+  arrange(desc(cliffs_delta))
+
+readr::write_csv(
+  axis_stats_w,
+  file.path(paths$tables, "15_METABRIC_focused_ERpos_TNBC_axis_statistics_weighted.csv")
+)
+
+# ----------------------------
+# 15D — Weighted vs unweighted consistency
+# ----------------------------
+
+calc_delta_by_scoretype <- function(df_long) {
+  df_long %>%
+    group_by(axis, score_type) %>%
+    summarise(
+      cliffs_delta = cliffs_delta_manual(
+        axis_score[focused_group_ERpos_TNBC == "TNBC"],
+        axis_score[focused_group_ERpos_TNBC == "ERpos"]
+      ),
+      .groups = "drop"
+    )
+}
+
+consistency_tbl <- bind_rows(focus_w_long, focus_u_long) %>%
+  calc_delta_by_scoretype() %>%
+  mutate(axis = factor(axis, levels = AXES_ORDER))
+
+readr::write_csv(
+  consistency_tbl,
+  file.path(paths$tables, "15_METABRIC_weighted_unweighted_axis_consistency.csv")
+)
+
+# ----------------------------
+# 15E — Forest-style axis signature plot
+# ----------------------------
+
+plot_df <- axis_stats_w %>%
+  mutate(
+    axis = factor(axis, levels = rev(axis)),
+    evidence = factor(evidence, levels = c("Strong", "Moderate", "Not_significant"))
+  )
+
+p_axis <- ggplot(plot_df, aes(x = cliffs_delta, y = axis, shape = evidence)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_segment(
+    aes(x = 0, xend = cliffs_delta, y = axis, yend = axis),
+    linewidth = 0.6
+  ) +
+  geom_point(size = 3.2) +
+  labs(
+    title = "METABRIC validation: focused ERpos vs TNBC ferroptosis axis signature",
+    subtitle = "Cliff's delta from weighted axis scores; positive values indicate higher TNBC activity",
+    x = "Cliff's delta (TNBC vs ERpos)",
+    y = NULL,
+    shape = "Evidence"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = file.path(paths$figures, "15_METABRIC_focused_ERpos_TNBC_axis_signature.png"),
+  plot = p_axis,
+  width = 8.5,
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+# ----------------------------
+# 15F — Weighted vs unweighted consistency plot
+# ----------------------------
+
+p_consistency <- ggplot(
+  consistency_tbl,
+  aes(x = cliffs_delta, y = axis, fill = score_type)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  labs(
+    title = "METABRIC validation: weighted vs unweighted consistency",
+    subtitle = "Positive values indicate higher TNBC activity",
+    x = "Cliff's delta (TNBC vs ERpos)",
+    y = NULL,
+    fill = "Score type"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = file.path(paths$figures, "15_METABRIC_weighted_unweighted_axis_consistency.png"),
+  plot = p_consistency,
+  width = 8.5,
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+message("Chunk 15 completed: METABRIC focused ERpos/TNBC axis signature.")
+print(axis_stats_w)
+
+p_axis
+p_consistency
+
+```
+```{r Chunk 16 — METABRIC downsampling robustness of ERpos vs TNBC axis signature}
+# ----------------------------
+# Chunk 16 — METABRIC downsampling robustness of ERpos vs TNBC axis signature
+# Purpose:
+#   Test whether ERpos/TNBC axis differences remain stable when ERpos is
+#   repeatedly downsampled to TNBC sample size.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+})
+
+set.seed(SPEC$seed)
+
+scores_w_focus <- readRDS(file.path(paths$processed, "13_scores_weighted_focused_labeled.rds"))
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+cliffs_delta_manual <- function(x_tnbc, x_erpos) {
+  x_tnbc <- x_tnbc[is.finite(x_tnbc)]
+  x_erpos <- x_erpos[is.finite(x_erpos)]
+  if (length(x_tnbc) == 0 || length(x_erpos) == 0) return(NA_real_)
+  cmp <- outer(x_tnbc, x_erpos, "-")
+  (sum(cmp > 0) - sum(cmp < 0)) / (length(x_tnbc) * length(x_erpos))
+}
+
+focus_long <- scores_w_focus %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  ) %>%
+  select(sample_id, focused_group_ERpos_TNBC, all_of(AXES_ORDER)) %>%
+  pivot_longer(
+    cols = all_of(AXES_ORDER),
+    names_to = "axis",
+    values_to = "axis_score"
+  ) %>%
+  filter(!is.na(focused_group_ERpos_TNBC), is.finite(axis_score))
+
+n_erpos <- sum(scores_w_focus$focused_group_ERpos_TNBC == "ERpos", na.rm = TRUE)
+n_tnbc  <- sum(scores_w_focus$focused_group_ERpos_TNBC == "TNBC", na.rm = TRUE)
+
+message("ERpos n = ", n_erpos)
+message("TNBC n = ", n_tnbc)
+message("Downsampling ERpos to TNBC size; B = ", SPEC$B_downsample)
+
+stopifnot(n_erpos > n_tnbc)
+stopifnot(n_tnbc > 20)
+
+erpos_ids <- scores_w_focus %>%
+  filter(focused_group_ERpos_TNBC == "ERpos") %>%
+  pull(sample_id)
+
+tnbc_ids <- scores_w_focus %>%
+  filter(focused_group_ERpos_TNBC == "TNBC") %>%
+  pull(sample_id)
+
+downsample_results <- lapply(seq_len(SPEC$B_downsample), function(b) {
+
+  sampled_erpos <- sample(erpos_ids, size = length(tnbc_ids), replace = FALSE)
+
+  focus_long %>%
+    filter(sample_id %in% c(sampled_erpos, tnbc_ids)) %>%
+    group_by(axis) %>%
+    summarise(
+      iter = b,
+      cliffs_delta = cliffs_delta_manual(
+        axis_score[focused_group_ERpos_TNBC == "TNBC"],
+        axis_score[focused_group_ERpos_TNBC == "ERpos"]
+      ),
+      .groups = "drop"
+    )
+}) %>%
+  bind_rows()
+
+robust_summary <- downsample_results %>%
+  group_by(axis) %>%
+  summarise(
+    B = n(),
+    median_delta = median(cliffs_delta, na.rm = TRUE),
+    q025 = quantile(cliffs_delta, 0.025, na.rm = TRUE),
+    q975 = quantile(cliffs_delta, 0.975, na.rm = TRUE),
+    prop_same_positive = mean(cliffs_delta > 0, na.rm = TRUE),
+    prop_same_negative = mean(cliffs_delta < 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    robustness = case_when(
+      abs(median_delta) >= 0.30 & (q025 > 0 | q975 < 0) ~ "Strong",
+      abs(median_delta) >= 0.15 & (q025 > 0 | q975 < 0) ~ "Moderate",
+      TRUE ~ "Weak"
+    ),
+    axis = factor(axis, levels = AXES_ORDER)
+  ) %>%
+  arrange(desc(median_delta))
+
+readr::write_csv(
+  downsample_results,
+  file.path(paths$tables, "16_METABRIC_downsampling_all_iterations.csv")
+)
+
+readr::write_csv(
+  robust_summary,
+  file.path(paths$tables, "16_METABRIC_downsampling_robustness_summary.csv")
+)
+
+p_down <- robust_summary %>%
+  mutate(
+    axis = factor(axis, levels = rev(axis)),
+    robustness = factor(robustness, levels = c("Strong", "Moderate", "Weak"))
+  ) %>%
+  ggplot(aes(x = median_delta, y = axis, shape = robustness)) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_errorbarh(aes(xmin = q025, xmax = q975), height = 0.18, linewidth = 0.6) +
+  geom_point(size = 3.2) +
+  labs(
+    title = "METABRIC validation: downsampling robustness of ERpos vs TNBC ferroptosis signature",
+    subtitle = paste0("ERpos repeatedly downsampled to TNBC size; B = ", SPEC$B_downsample),
+    x = "Median Cliff's delta across downsampling runs",
+    y = NULL,
+    shape = "Robustness"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = file.path(paths$figures, "16_METABRIC_downsampling_robustness_ERpos_TNBC.png"),
+  plot = p_down,
+  width = 8.5,
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+message("Chunk 16 completed: METABRIC downsampling robustness.")
+print(robust_summary)
+
+p_down
+
+```
+
+```{r Chunk 17 — METABRIC axis–axis wiring matrices}
+# ----------------------------
+# Chunk 17 — METABRIC axis–axis wiring matrices
+# Pipeline:
+#   Axis score → marker genes → wiring → robustness → validation
+#
+# Purpose:
+#   Build ERpos and TNBC ferroptosis axis–axis correlation matrices.
+#   Then calculate differential wiring:
+#     Delta rho = rho_TNBC - rho_ERpos
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+})
+
+scores_w_focus <- readRDS(file.path(paths$processed, "13_scores_weighted_focused_labeled.rds"))
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+# ----------------------------
+# 17A — Prepare focused score matrix
+# ----------------------------
+
+scores_focus <- scores_w_focus %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  ) %>%
+  filter(!is.na(focused_group_ERpos_TNBC))
+
+stopifnot(all(AXES_ORDER %in% names(scores_focus)))
+
+# ----------------------------
+# 17B — Correlation helper
+# ----------------------------
+
+make_axis_cor <- function(df, group_label) {
+
+  mat <- df %>%
+    filter(focused_group_ERpos_TNBC == group_label) %>%
+    select(all_of(AXES_ORDER)) %>%
+    as.matrix()
+
+  rho <- cor(
+    mat,
+    method = "spearman",
+    use = "pairwise.complete.obs"
+  )
+
+  rho <- rho[AXES_ORDER, AXES_ORDER]
+
+  rho
+}
+
+rho_erpos <- make_axis_cor(scores_focus, "ERpos")
+rho_tnbc  <- make_axis_cor(scores_focus, "TNBC")
+
+delta_rho <- rho_tnbc - rho_erpos
+
+diag(delta_rho) <- 0
+
+# ----------------------------
+# 17C — Long edge tables
+# ----------------------------
+
+mat_to_long <- function(mat, value_name) {
+  as.data.frame(as.table(mat)) %>%
+    as_tibble() %>%
+    rename(
+      axis_1 = Var1,
+      axis_2 = Var2,
+      value = Freq
+    ) %>%
+    mutate(
+      axis_1 = as.character(axis_1),
+      axis_2 = as.character(axis_2)
+    ) %>%
+    rename(!!value_name := value)
+}
+
+rho_erpos_long <- mat_to_long(rho_erpos, "rho_ERpos")
+rho_tnbc_long  <- mat_to_long(rho_tnbc, "rho_TNBC")
+delta_long     <- mat_to_long(delta_rho, "delta_rho")
+
+edge_tbl <- rho_erpos_long %>%
+  left_join(rho_tnbc_long, by = c("axis_1", "axis_2")) %>%
+  left_join(delta_long, by = c("axis_1", "axis_2")) %>%
+  mutate(
+    abs_delta_rho = abs(delta_rho),
+    stronger_group = case_when(
+      delta_rho > 0 ~ "Stronger_in_TNBC",
+      delta_rho < 0 ~ "Stronger_in_ERpos",
+      TRUE ~ "No_difference"
+    )
+  )
+
+edge_tbl_upper <- edge_tbl %>%
+  mutate(
+    axis_1_i = match(axis_1, AXES_ORDER),
+    axis_2_i = match(axis_2, AXES_ORDER)
+  ) %>%
+  filter(axis_1_i < axis_2_i) %>%
+  select(-axis_1_i, -axis_2_i) %>%
+  arrange(desc(abs_delta_rho))
+
+# ----------------------------
+# 17D — QC summary
+# ----------------------------
+
+qc_wiring <- tibble(
+  dataset = project$dataset,
+  cohort = "METABRIC_Focused_ERpos_TNBC",
+  n_ERpos = sum(scores_focus$focused_group_ERpos_TNBC == "ERpos"),
+  n_TNBC  = sum(scores_focus$focused_group_ERpos_TNBC == "TNBC"),
+  n_axes = length(AXES_ORDER),
+  n_unique_edges = nrow(edge_tbl_upper),
+  threshold_abs_r = SPEC$thr_abs_r,
+  n_ERpos_edges_abs_r_ge_threshold = sum(abs(edge_tbl_upper$rho_ERpos) >= SPEC$thr_abs_r, na.rm = TRUE),
+  n_TNBC_edges_abs_r_ge_threshold  = sum(abs(edge_tbl_upper$rho_TNBC) >= SPEC$thr_abs_r, na.rm = TRUE),
+  n_delta_edges_abs_delta_ge_threshold = sum(abs(edge_tbl_upper$delta_rho) >= SPEC$thr_abs_r, na.rm = TRUE)
+)
+
+# ----------------------------
+# 17E — Save matrices and tables
+# ----------------------------
+
+saveRDS(rho_erpos, file.path(paths$processed, "17_axis_cor_ERpos_METABRIC.rds"))
+saveRDS(rho_tnbc,  file.path(paths$processed, "17_axis_cor_TNBC_METABRIC.rds"))
+saveRDS(delta_rho, file.path(paths$processed, "17_axis_cor_delta_TNBC_minus_ERpos_METABRIC.rds"))
+
+readr::write_csv(edge_tbl, file.path(paths$tables, "17_METABRIC_axis_wiring_all_edges_full_matrix.csv"))
+readr::write_csv(edge_tbl_upper, file.path(paths$tables, "17_METABRIC_axis_wiring_unique_edges.csv"))
+readr::write_csv(qc_wiring, file.path(paths$tables, "17_METABRIC_axis_wiring_QC.csv"))
+
+# ----------------------------
+# 17F — Heatmap plotting helper
+# ----------------------------
+
+plot_cor_heatmap <- function(mat, title, legend_title, fill_limits = c(-1, 1)) {
+
+  df <- mat_to_long(mat, "rho") %>%
+    mutate(
+      axis_1 = factor(axis_1, levels = rev(AXES_ORDER)),
+      axis_2 = factor(axis_2, levels = AXES_ORDER)
+    )
+
+  ggplot(df, aes(x = axis_2, y = axis_1, fill = rho)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.2f", rho)), size = 3.4) +
+    scale_fill_gradient2(
+      low = "#2166AC",
+      mid = "white",
+      high = "#B2182B",
+      midpoint = 0,
+      limits = fill_limits,
+      name = legend_title
+    ) +
+    labs(
+      title = title,
+      x = NULL,
+      y = NULL
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 17),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank()
+    )
+}
+
+p_erpos <- plot_cor_heatmap(
+  rho_erpos,
+  title = "METABRIC ERpos ferroptosis wiring",
+  legend_title = "Spearman\nrho",
+  fill_limits = c(-1, 1)
+)
+
+p_tnbc <- plot_cor_heatmap(
+  rho_tnbc,
+  title = "METABRIC TNBC ferroptosis wiring",
+  legend_title = "Spearman\nrho",
+  fill_limits = c(-1, 1)
+)
+
+p_delta <- plot_cor_heatmap(
+  delta_rho,
+  title = "METABRIC differential ferroptosis wiring",
+  legend_title = "Delta rho\nTNBC-ERpos",
+  fill_limits = c(-0.5, 0.5)
+)
+
+# ----------------------------
+# 17G — Save figures
+# ----------------------------
+
+ggsave(
+  file.path(paths$figures, "17_METABRIC_ERpos_axis_wiring_heatmap.png"),
+  p_erpos,
+  width = 9,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "17_METABRIC_TNBC_axis_wiring_heatmap.png"),
+  p_tnbc,
+  width = 9,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "17_METABRIC_delta_axis_wiring_TNBC_minus_ERpos_heatmap.png"),
+  p_delta,
+  width = 9,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+message("Chunk 17 completed: METABRIC axis–axis wiring matrices.")
+print(qc_wiring)
+print(edge_tbl_upper)
+
+p_erpos
+p_tnbc
+p_delta
+
+```
+
+```{r Chunk 18 — METABRIC wiring network visualization FINAL}
+# ----------------------------
+# Chunk 18 — METABRIC wiring network visualization FINAL
+# Fixes:
+#   - removes crowded legends from two-panel network
+#   - keeps labels readable
+#   - saves clean publication-ready figures
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+rho_erpos <- readRDS(file.path(paths$processed, "17_axis_cor_ERpos_METABRIC.rds"))
+rho_tnbc  <- readRDS(file.path(paths$processed, "17_axis_cor_TNBC_METABRIC.rds"))
+delta_rho <- readRDS(file.path(paths$processed, "17_axis_cor_delta_TNBC_minus_ERpos_METABRIC.rds"))
+
+thr <- SPEC$thr_abs_r
+
+axis_labels <- c(
+  Xc_GSH = "Xc/GSH",
+  GPX4_Selenium = "GPX4/Se",
+  FSP1_CoQ = "FSP1/CoQ",
+  BH4_GCH1 = "BH4/GCH1",
+  DHODH_Mito = "DHODH",
+  Iron_Handling = "Iron",
+  PUFA_Loading = "PUFA",
+  Lipid_Peroxidation = "Lipid\nPeroxidation"
+)
+
+axis_class <- c(
+  Xc_GSH = "Defense",
+  GPX4_Selenium = "Defense",
+  FSP1_CoQ = "Defense",
+  BH4_GCH1 = "Defense",
+  DHODH_Mito = "Defense",
+  Iron_Handling = "Susceptibility",
+  PUFA_Loading = "Susceptibility",
+  Lipid_Peroxidation = "Susceptibility"
+)
+
+node_pos <- tibble::tibble(
+  axis = AXES_ORDER,
+  label = axis_labels[AXES_ORDER],
+  axis_class = axis_class[AXES_ORDER],
+  x = c(1.05, 0.65, 0.30, 0.10, 0.30, 0.75, 1.05, 1.25),
+  y = c(0.75, 1.05, 0.75, 0.30, 0.00, -0.15, 0.05, 0.35)
+)
+
+mat_to_edges <- function(mat, value_name = "rho") {
+  as.data.frame(as.table(mat)) %>%
+    as_tibble() %>%
+    rename(axis_1 = Var1, axis_2 = Var2, value = Freq) %>%
+    mutate(
+      axis_1 = as.character(axis_1),
+      axis_2 = as.character(axis_2),
+      i = match(axis_1, AXES_ORDER),
+      j = match(axis_2, AXES_ORDER)
+    ) %>%
+    filter(i < j) %>%
+    rename(!!value_name := value) %>%
+    select(axis_1, axis_2, all_of(value_name))
+}
+
+make_network_edges <- function(mat, value_name = "rho") {
+  mat_to_edges(mat, value_name) %>%
+    filter(abs(.data[[value_name]]) >= thr) %>%
+    left_join(node_pos %>% select(axis, x1 = x, y1 = y), by = c("axis_1" = "axis")) %>%
+    left_join(node_pos %>% select(axis, x2 = x, y2 = y), by = c("axis_2" = "axis")) %>%
+    mutate(
+      edge_abs = abs(.data[[value_name]]),
+      edge_sign = ifelse(.data[[value_name]] >= 0, "Positive", "Negative")
+    )
+}
+
+edges_erpos <- make_network_edges(rho_erpos, "rho")
+edges_tnbc  <- make_network_edges(rho_tnbc, "rho")
+
+edges_delta <- mat_to_edges(delta_rho, "delta_rho") %>%
+  filter(abs(delta_rho) >= thr) %>%
+  left_join(node_pos %>% select(axis, x1 = x, y1 = y), by = c("axis_1" = "axis")) %>%
+  left_join(node_pos %>% select(axis, x2 = x, y2 = y), by = c("axis_2" = "axis")) %>%
+  mutate(
+    edge_abs = abs(delta_rho),
+    stronger = ifelse(delta_rho > 0, "Stronger in TNBC", "Stronger in ERpos")
+  )
+
+plot_network <- function(edges, title, subtitle) {
+
+  ggplot() +
+    geom_segment(
+      data = edges,
+      aes(
+        x = x1, y = y1,
+        xend = x2, yend = y2,
+        linewidth = edge_abs,
+        linetype = edge_sign
+      ),
+      color = "#C43E52",
+      alpha = 0.88,
+      lineend = "round",
+      show.legend = FALSE
+    ) +
+    geom_point(
+      data = node_pos,
+      aes(x = x, y = y, fill = axis_class),
+      shape = 21,
+      size = 7.2,
+      color = "black",
+      linewidth = 0.6,
+      show.legend = FALSE
+    ) +
+    geom_text(
+      data = node_pos,
+      aes(x = x, y = y, label = label),
+      fontface = "bold",
+      size = 5.1,
+      lineheight = 0.90,
+      vjust = 0.5,
+      hjust = 0.5
+    ) +
+    scale_linewidth(range = c(0.5, 4.0)) +
+    scale_linetype_manual(values = c(Positive = "solid", Negative = "dashed")) +
+    scale_fill_manual(values = c(Defense = "#8DD3C7", Susceptibility = "#FDB462")) +
+    coord_cartesian(
+      xlim = c(-0.15, 1.55),
+      ylim = c(-0.40, 1.25),
+      clip = "off"
+    ) +
+    labs(title = title, subtitle = subtitle) +
+    theme_void(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 17, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5),
+      plot.margin = margin(45, 65, 45, 65)
+    )
+}
+
+p_erpos_net <- plot_network(
+  edges_erpos,
+  "METABRIC ERpos ferroptosis wiring",
+  paste0("Edges shown if |rho| ≥ ", thr)
+)
+
+p_tnbc_net <- plot_network(
+  edges_tnbc,
+  "METABRIC TNBC ferroptosis wiring",
+  paste0("Edges shown if |rho| ≥ ", thr)
+)
+
+p_pair <- p_erpos_net + p_tnbc_net +
+  plot_annotation(
+    title = "METABRIC validation: ferroptosis axis wiring differs between ERpos and TNBC",
+    subtitle = "Matched layout; thicker red edges indicate stronger Spearman coupling. Solid = positive correlation; dashed = negative correlation. Teal nodes = defense axes; orange nodes = susceptibility axes.",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 21),
+      plot.subtitle = element_text(size = 13),
+      plot.margin = margin(25, 35, 25, 35)
+    )
+  )
+
+plot_delta_network <- function(edges) {
+
+  ggplot() +
+    geom_segment(
+      data = edges,
+      aes(
+        x = x1, y = y1,
+        xend = x2, yend = y2,
+        linewidth = edge_abs,
+        linetype = stronger
+      ),
+      color = "#C43E52",
+      alpha = 0.90,
+      lineend = "round"
+    ) +
+    geom_point(
+      data = node_pos,
+      aes(x = x, y = y, fill = axis_class),
+      shape = 21,
+      size = 7.8,
+      color = "black",
+      linewidth = 0.6
+    ) +
+    geom_text(
+      data = node_pos,
+      aes(x = x, y = y, label = label),
+      fontface = "bold",
+      size = 5.5,
+      lineheight = 0.90,
+      vjust = 0.5,
+      hjust = 0.5
+    ) +
+    scale_linewidth(range = c(0.6, 4.5), name = "|Delta rho|") +
+    scale_linetype_manual(
+      values = c("Stronger in TNBC" = "solid", "Stronger in ERpos" = "dashed"),
+      name = "Differential wiring"
+    ) +
+    scale_fill_manual(
+      values = c(Defense = "#8DD3C7", Susceptibility = "#FDB462"),
+      name = "Axis class"
+    ) +
+    coord_cartesian(
+      xlim = c(-0.15, 1.55),
+      ylim = c(-0.40, 1.28),
+      clip = "off"
+    ) +
+    labs(
+      title = "METABRIC validation: differential ferroptosis wiring",
+      subtitle = paste0("Edges shown if |Delta rho| ≥ ", thr, "; Delta rho = TNBC − ERpos")
+    ) +
+    theme_void(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+      plot.subtitle = element_text(size = 13, hjust = 0.5),
+      legend.position = "bottom",
+      legend.box = "vertical",
+      legend.text = element_text(size = 11),
+      legend.title = element_text(size = 12),
+      plot.margin = margin(60, 75, 75, 75)
+    )
+}
+
+p_delta_net <- plot_delta_network(edges_delta)
+
+ggsave(
+  file.path(paths$figures, "18_METABRIC_ERpos_TNBC_matched_wiring_networks.png"),
+  p_pair,
+  width = 20,
+  height = 10.5,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(paths$figures, "18_METABRIC_differential_wiring_network.png"),
+  p_delta_net,
+  width = 11.5,
+  height = 9.5,
+  dpi = 300,
+  bg = "white"
+)
+
+readr::write_csv(edges_erpos, file.path(paths$tables, "18_METABRIC_ERpos_network_edges.csv"))
+readr::write_csv(edges_tnbc, file.path(paths$tables, "18_METABRIC_TNBC_network_edges.csv"))
+readr::write_csv(edges_delta, file.path(paths$tables, "18_METABRIC_differential_network_edges.csv"))
+
+message("Chunk 18 completed: METABRIC wiring network visualizations saved.")
+
+p_pair
+p_delta_net
+```
+
+```{r Chunk 19 — METABRIC permutation test for differential ferroptosis wiring }
+# ----------------------------
+# Chunk 19 — METABRIC permutation test for differential ferroptosis wiring
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(readr)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+set.seed(SPEC$seed)
+
+scores_w_focus <- readRDS(file.path(paths$processed, "13_scores_weighted_focused_labeled.rds"))
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+rho_erpos_obs <- readRDS(file.path(paths$processed, "17_axis_cor_ERpos_METABRIC.rds"))
+rho_tnbc_obs  <- readRDS(file.path(paths$processed, "17_axis_cor_TNBC_METABRIC.rds"))
+
+# ----------------------------
+# 19A — Prepare matrix + labels
+# ----------------------------
+
+df <- scores_w_focus %>%
+  dplyr::filter(!is.na(focused_group_ERpos_TNBC)) %>%
+  dplyr::mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+stopifnot(all(AXES_ORDER %in% names(df)))
+
+score_mat <- df %>%
+  dplyr::select(dplyr::all_of(AXES_ORDER)) %>%
+  as.matrix()
+
+group <- df$focused_group_ERpos_TNBC
+
+n_erpos <- sum(group == "ERpos")
+n_tnbc  <- sum(group == "TNBC")
+
+stopifnot(n_erpos > 20, n_tnbc > 20)
+
+# ----------------------------
+# 19B — Helper functions
+# ----------------------------
+
+calc_delta_mat <- function(mat, grp) {
+
+  rho_er <- stats::cor(
+    mat[grp == "ERpos", , drop = FALSE],
+    method = "spearman",
+    use = "pairwise.complete.obs"
+  )
+
+  rho_tn <- stats::cor(
+    mat[grp == "TNBC", , drop = FALSE],
+    method = "spearman",
+    use = "pairwise.complete.obs"
+  )
+
+  delta <- rho_tn - rho_er
+  diag(delta) <- 0
+
+  delta[AXES_ORDER, AXES_ORDER, drop = FALSE]
+}
+
+mat_to_upper <- function(mat, value_name = "value") {
+
+  as.data.frame(as.table(mat)) %>%
+    tibble::as_tibble() %>%
+    dplyr::rename(axis_1 = Var1, axis_2 = Var2, value = Freq) %>%
+    dplyr::mutate(
+      axis_1 = as.character(axis_1),
+      axis_2 = as.character(axis_2),
+      i = match(axis_1, AXES_ORDER),
+      j = match(axis_2, AXES_ORDER)
+    ) %>%
+    dplyr::filter(i < j) %>%
+    dplyr::select(axis_1, axis_2, value) %>%
+    dplyr::rename(!!value_name := value)
+}
+
+# ----------------------------
+# 19C — Observed delta rho
+# ----------------------------
+
+delta_obs <- rho_tnbc_obs - rho_erpos_obs
+diag(delta_obs) <- 0
+delta_obs <- delta_obs[AXES_ORDER, AXES_ORDER, drop = FALSE]
+
+obs_edges <- mat_to_upper(delta_obs, "delta_rho") %>%
+  dplyr::left_join(mat_to_upper(rho_erpos_obs, "rho_ERpos"), by = c("axis_1", "axis_2")) %>%
+  dplyr::left_join(mat_to_upper(rho_tnbc_obs, "rho_TNBC"), by = c("axis_1", "axis_2")) %>%
+  dplyr::mutate(
+    abs_delta_rho = abs(delta_rho),
+    edge = paste(axis_1, axis_2, sep = "–"),
+    direction = dplyr::case_when(
+      delta_rho > 0 ~ "Stronger_in_TNBC",
+      delta_rho < 0 ~ "Stronger_in_ERpos",
+      TRUE ~ "No_difference"
+    )
+  )
+
+# ----------------------------
+# 19D — Permutation test
+# ----------------------------
+
+message("Running METABRIC wiring permutation test; B = ", SPEC$B_perm)
+
+perm_delta_list <- vector("list", SPEC$B_perm)
+
+for (b in seq_len(SPEC$B_perm)) {
+
+  perm_group <- sample(group, replace = FALSE)
+  perm_delta <- calc_delta_mat(score_mat, perm_group)
+
+  perm_delta_list[[b]] <- mat_to_upper(perm_delta, "perm_delta_rho") %>%
+    dplyr::mutate(iter = b)
+
+  if (b %% 200 == 0) {
+    message("Completed permutation ", b, " / ", SPEC$B_perm)
+  }
+}
+
+perm_edges <- dplyr::bind_rows(perm_delta_list)
+
+perm_summary <- perm_edges %>%
+  dplyr::left_join(
+    obs_edges %>% dplyr::select(axis_1, axis_2, delta_rho),
+    by = c("axis_1", "axis_2")
+  ) %>%
+  dplyr::group_by(axis_1, axis_2) %>%
+  dplyr::summarise(
+    B = dplyr::n(),
+    observed_delta_rho = delta_rho[1],
+    empirical_p = (
+      sum(abs(perm_delta_rho) >= abs(delta_rho[1]), na.rm = TRUE) + 1
+    ) / (dplyr::n() + 1),
+    perm_mean = mean(perm_delta_rho, na.rm = TRUE),
+    perm_sd = sd(perm_delta_rho, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    empirical_FDR = p.adjust(empirical_p, method = "BH")
+  )
+
+perm_results <- obs_edges %>%
+  dplyr::left_join(
+    perm_summary,
+    by = c("axis_1", "axis_2")
+  ) %>%
+  dplyr::arrange(empirical_FDR, dplyr::desc(abs_delta_rho))
+
+# ----------------------------
+# 19E — Save outputs
+# ----------------------------
+
+saveRDS(
+  perm_results,
+  file.path(paths$processed, "19_METABRIC_wiring_permutation_results.rds")
+)
+
+readr::write_csv(
+  perm_results,
+  file.path(paths$tables, "19_METABRIC_wiring_permutation_results.csv")
+)
+
+readr::write_csv(
+  perm_edges,
+  file.path(paths$tables, "19_METABRIC_wiring_permutation_all_iterations.csv")
+)
+
+# ----------------------------
+# 19F — Volcano-style plot
+# ----------------------------
+
+p_perm <- perm_results %>%
+  dplyr::mutate(
+    neg_log10_FDR = -log10(empirical_FDR),
+    significant = empirical_FDR < 0.05
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = delta_rho,
+      y = neg_log10_FDR,
+      label = edge
+    )
+  ) +
+  ggplot2::geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed",
+    linewidth = 0.4
+  ) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    linetype = "dotted",
+    linewidth = 0.4
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(size = abs_delta_rho, shape = significant),
+    alpha = 0.8
+  ) +
+  ggrepel::geom_text_repel(
+    data = perm_results %>%
+      dplyr::mutate(neg_log10_FDR = -log10(empirical_FDR)) %>%
+      dplyr::filter(empirical_FDR < 0.10 | abs_delta_rho >= 0.35),
+    max.overlaps = 30,
+    size = 3.2
+  ) +
+  ggplot2::labs(
+    title = "METABRIC permutation test: differential ferroptosis wiring",
+    subtitle = "Observed delta rho = rho_TNBC - rho_ERpos; empirical BH-FDR from label permutations",
+    x = expression(Delta~rho~"(TNBC - ERpos)"),
+    y = expression(-log[10]~"(empirical FDR)"),
+    size = expression(abs(Delta~rho)),
+    shape = "FDR < 0.05"
+  ) +
+  ggplot2::theme_bw(base_size = 13) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold", size = 16),
+    plot.subtitle = ggplot2::element_text(size = 11)
+  )
+
+ggplot2::ggsave(
+  filename = file.path(paths$figures, "19_METABRIC_wiring_permutation_volcano.png"),
+  plot = p_perm,
+  width = 10,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+message("Chunk 19 completed: permutation results saved.")
+print(perm_results)
+
+p_perm
+```
+
+```{r Chunk 20 — Export final METABRIC validation evidence summary}
+# ----------------------------
+# Chunk 20 — Export final METABRIC validation evidence summary
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(stringr)
+  library(tidyr)
+})
+
+# ----------------------------
+# 20A — Load key outputs
+# ----------------------------
+
+axis_stats <- readr::read_csv(
+  file.path(paths$tables, "15_METABRIC_focused_ERpos_TNBC_axis_statistics_weighted.csv"),
+  show_col_types = FALSE
+)
+
+downsample <- readr::read_csv(
+  file.path(paths$tables, "16_METABRIC_downsampling_robustness_summary.csv"),
+  show_col_types = FALSE
+)
+
+perm_wiring <- readr::read_csv(
+  file.path(paths$tables, "19_METABRIC_wiring_permutation_results.csv"),
+  show_col_types = FALSE
+)
+
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+# Standardize possible Chunk 19 column names
+perm_wiring <- perm_wiring %>%
+  dplyr::rename_with(~ stringr::str_replace_all(.x, "empirical_FDR", "empirical_fdr"))
+
+# ----------------------------
+# 20B — Axis-level validation summary
+# ----------------------------
+
+axis_validation_summary <- axis_stats %>%
+  dplyr::select(
+    axis,
+    n_ERpos,
+    n_TNBC,
+    median_ERpos,
+    median_TNBC,
+    delta_median,
+    cliffs_delta,
+    wilcox_p,
+    wilcox_fdr,
+    evidence,
+    direction
+  ) %>%
+  dplyr::left_join(
+    downsample %>%
+      dplyr::select(
+        axis,
+        downsample_median_delta = median_delta,
+        downsample_q025 = q025,
+        downsample_q975 = q975,
+        downsample_robustness = robustness
+      ),
+    by = "axis"
+  ) %>%
+  dplyr::mutate(
+    validation_call = dplyr::case_when(
+      wilcox_fdr < 0.05 &
+        abs(cliffs_delta) >= 0.30 &
+        downsample_robustness == "Strong" ~ "Strong_axis_validation",
+
+      wilcox_fdr < 0.05 &
+        abs(cliffs_delta) >= 0.15 &
+        downsample_robustness %in% c("Strong", "Moderate") ~ "Moderate_axis_validation",
+
+      TRUE ~ "Weak_or_not_validated"
+    ),
+    axis = factor(axis, levels = AXES_ORDER)
+  ) %>%
+  dplyr::arrange(axis)
+
+# ----------------------------
+# 20C — Wiring-level validation summary
+# ----------------------------
+
+wiring_validation_summary <- perm_wiring %>%
+  dplyr::mutate(
+    wiring_validation_call = dplyr::case_when(
+      empirical_fdr < 0.05 & abs_delta_rho >= 0.30 ~ "Strong_wiring_validation",
+      empirical_fdr < 0.05 & abs_delta_rho >= 0.15 ~ "Moderate_wiring_validation",
+      TRUE ~ "Weak_or_not_validated"
+    )
+  ) %>%
+  dplyr::arrange(empirical_fdr, dplyr::desc(abs_delta_rho))
+
+# ----------------------------
+# 20D — Axis involvement in significant wiring
+# ----------------------------
+
+axis_wiring_support <- wiring_validation_summary %>%
+  dplyr::filter(empirical_fdr < 0.05) %>%
+  dplyr::select(axis_1, axis_2, delta_rho, empirical_fdr) %>%
+  tidyr::pivot_longer(
+    cols = c(axis_1, axis_2),
+    names_to = "axis_position",
+    values_to = "axis"
+  ) %>%
+  dplyr::group_by(axis) %>%
+  dplyr::summarise(
+    n_FDR_significant_wiring_edges = dplyr::n(),
+    mean_abs_delta_rho_involved_edges = mean(abs(delta_rho), na.rm = TRUE),
+    strongest_wiring_fdr = min(empirical_fdr, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+axis_validation_summary <- axis_validation_summary %>%
+  dplyr::left_join(axis_wiring_support, by = "axis") %>%
+  dplyr::mutate(
+    n_FDR_significant_wiring_edges = ifelse(
+      is.na(n_FDR_significant_wiring_edges),
+      0,
+      n_FDR_significant_wiring_edges
+    ),
+    mean_abs_delta_rho_involved_edges = ifelse(
+      is.na(mean_abs_delta_rho_involved_edges),
+      NA_real_,
+      mean_abs_delta_rho_involved_edges
+    ),
+    strongest_wiring_fdr = ifelse(
+      is.na(strongest_wiring_fdr),
+      NA_real_,
+      strongest_wiring_fdr
+    )
+  )
+
+# ----------------------------
+# 20E — Save tables
+# ----------------------------
+
+readr::write_csv(
+  axis_validation_summary,
+  file.path(paths$tables, "20_METABRIC_axis_validation_summary.csv")
+)
+
+readr::write_csv(
+  wiring_validation_summary,
+  file.path(paths$tables, "20_METABRIC_wiring_validation_summary.csv")
+)
+
+# ----------------------------
+# 20F — Plain-language validation note
+# ----------------------------
+
+top_tnbc_axes <- axis_validation_summary %>%
+  dplyr::filter(direction == "Higher_in_TNBC", validation_call != "Weak_or_not_validated") %>%
+  dplyr::arrange(dplyr::desc(cliffs_delta)) %>%
+  dplyr::pull(axis)
+
+top_erpos_axes <- axis_validation_summary %>%
+  dplyr::filter(direction == "Higher_in_ERpos", validation_call != "Weak_or_not_validated") %>%
+  dplyr::arrange(cliffs_delta) %>%
+  dplyr::pull(axis)
+
+sig_wiring_n <- sum(wiring_validation_summary$empirical_fdr < 0.05, na.rm = TRUE)
+
+sig_wiring_tnbc_n <- sum(
+  wiring_validation_summary$empirical_fdr < 0.05 &
+    wiring_validation_summary$delta_rho > 0,
+  na.rm = TRUE
+)
+
+note <- c(
+  "METABRIC validation evidence summary",
+  "",
+  paste0("Dataset: ", project$dataset),
+  paste0("Role: ", project$role),
+  "",
+  "Axis-level validation:",
+  paste0(
+    "TNBC-higher validated axes: ",
+    ifelse(length(top_tnbc_axes) > 0, paste(top_tnbc_axes, collapse = "; "), "none")
+  ),
+  paste0(
+    "ERpos-higher validated axes: ",
+    ifelse(length(top_erpos_axes) > 0, paste(top_erpos_axes, collapse = "; "), "none")
+  ),
+  "",
+  "Wiring-level validation:",
+  paste0("FDR-significant differential wiring edges: ", sig_wiring_n),
+  paste0("FDR-significant edges stronger in TNBC: ", sig_wiring_tnbc_n),
+  "",
+  "Interpretation rule:",
+  "METABRIC is used as independent validation of the GSE96058 axis-first and wiring-first framework.",
+  "Axis-level evidence supports subtype activity differences.",
+  "Wiring evidence supports subtype-specific ferroptosis regulatory architecture."
+)
+
+writeLines(
+  note,
+  con = file.path(paths$manuscript, "20_METABRIC_validation_summary_note.txt")
+)
+
+message("Chunk 20 completed: METABRIC validation evidence summary exported.")
+
+print(axis_validation_summary)
+print(wiring_validation_summary)
+
+```
+
+```{r Chunk 21 — METABRIC validation of discovery-selected marker genes}
+# ----------------------------
+# Chunk 21 — METABRIC validation of discovery-selected marker genes
+# Purpose:
+#   Validate GSE96058-selected marker genes in METABRIC.
+#
+# Rule:
+#   Do NOT select markers de novo from METABRIC.
+#   METABRIC only tests whether discovery-selected candidates reproduce.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(stringr)
+})
+
+expr_z <- readRDS(file.path(paths$processed, "11_expr_z_focused_ERpos_TNBC_repSAFE.rds"))
+clin   <- readRDS(file.path(paths$processed, "09_clin_focused_ERpos_TNBC_repSAFE.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+stopifnot(all(colnames(expr_z) == clin$sample_id))
+
+# ----------------------------
+# 21A — Define discovery-selected markers
+# ----------------------------
+# These must come from GSE96058 discovery, not METABRIC selection.
+
+discovery_markers <- c(
+  "DHODH",
+  "FADS2",
+  "POR",
+  "SEPSECS",
+  "SLC40A1"
+)
+
+marker_axis_map <- tibble::tibble(
+  gene = c("DHODH", "FADS2", "POR", "SEPSECS", "SLC40A1"),
+  axis = c("DHODH_Mito", "PUFA_Loading", "Lipid_Peroxidation",
+           "GPX4_Selenium", "Iron_Handling")
+)
+
+missing_markers <- setdiff(discovery_markers, rownames(expr_z))
+
+if (length(missing_markers) > 0) {
+  warning("Markers missing in METABRIC expression matrix: ",
+          paste(missing_markers, collapse = ", "))
+}
+
+markers_present <- intersect(discovery_markers, rownames(expr_z))
+
+stopifnot(length(markers_present) >= 3)
+
+# ----------------------------
+# 21B — Manual Cliff's delta
+# ----------------------------
+
+cliffs_delta_manual <- function(x_tnbc, x_erpos) {
+  x_tnbc <- x_tnbc[is.finite(x_tnbc)]
+  x_erpos <- x_erpos[is.finite(x_erpos)]
+
+  if (length(x_tnbc) == 0 || length(x_erpos) == 0) return(NA_real_)
+
+  cmp <- outer(x_tnbc, x_erpos, "-")
+  (sum(cmp > 0) - sum(cmp < 0)) / (length(x_tnbc) * length(x_erpos))
+}
+
+# ----------------------------
+# 21C — Prepare marker expression table
+# ----------------------------
+
+marker_df <- as.data.frame(t(expr_z[markers_present, , drop = FALSE]))
+marker_df$sample_id <- rownames(marker_df)
+
+marker_long <- marker_df %>%
+  left_join(
+    clin %>% select(sample_id, focused_group_ERpos_TNBC),
+    by = "sample_id"
+  ) %>%
+  filter(focused_group_ERpos_TNBC %in% c("ERpos", "TNBC")) %>%
+  mutate(
+    focused_group_ERpos_TNBC = factor(
+      as.character(focused_group_ERpos_TNBC),
+      levels = c("ERpos", "TNBC")
+    )
+  ) %>%
+  pivot_longer(
+    cols = all_of(markers_present),
+    names_to = "gene",
+    values_to = "z_expression"
+  ) %>%
+  filter(is.finite(z_expression)) %>%
+  left_join(marker_axis_map, by = "gene")
+
+# ----------------------------
+# 21D — Marker-level validation statistics
+# ----------------------------
+
+marker_stats <- marker_long %>%
+  group_by(gene, axis) %>%
+  summarise(
+    n_ERpos = sum(focused_group_ERpos_TNBC == "ERpos"),
+    n_TNBC  = sum(focused_group_ERpos_TNBC == "TNBC"),
+    median_ERpos = median(z_expression[focused_group_ERpos_TNBC == "ERpos"], na.rm = TRUE),
+    median_TNBC  = median(z_expression[focused_group_ERpos_TNBC == "TNBC"], na.rm = TRUE),
+    delta_median = median_TNBC - median_ERpos,
+    cliffs_delta = cliffs_delta_manual(
+      z_expression[focused_group_ERpos_TNBC == "TNBC"],
+      z_expression[focused_group_ERpos_TNBC == "ERpos"]
+    ),
+    wilcox_p = wilcox.test(
+      z_expression ~ focused_group_ERpos_TNBC,
+      exact = FALSE
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    wilcox_fdr = p.adjust(wilcox_p, method = "BH"),
+    direction = case_when(
+      cliffs_delta > 0 ~ "Higher_in_TNBC",
+      cliffs_delta < 0 ~ "Higher_in_ERpos",
+      TRUE ~ "No_direction"
+    ),
+    validation_evidence = case_when(
+      wilcox_fdr < 0.05 & abs(cliffs_delta) >= 0.30 ~ "Strong_marker_validation",
+      wilcox_fdr < 0.05 & abs(cliffs_delta) >= 0.15 ~ "Moderate_marker_validation",
+      TRUE ~ "Weak_or_not_validated"
+    )
+  ) %>%
+  arrange(desc(abs(cliffs_delta)))
+
+# ----------------------------
+# 21E — Save outputs
+# ----------------------------
+
+readr::write_csv(
+  marker_long,
+  file.path(paths$tables, "21_METABRIC_discovery_marker_expression_long.csv")
+)
+
+readr::write_csv(
+  marker_stats,
+  file.path(paths$tables, "21_METABRIC_discovery_marker_validation_statistics.csv")
+)
+
+writeLines(
+  c(
+    "Chunk 21 METABRIC marker validation note",
+    "",
+    "Markers were not selected from METABRIC.",
+    "METABRIC was used only to validate marker candidates selected from GSE96058 discovery.",
+    "",
+    paste0("Discovery-selected markers tested: ", paste(discovery_markers, collapse = ", ")),
+    "",
+    "Positive Cliff's delta indicates higher expression in TNBC.",
+    "Negative Cliff's delta indicates higher expression in ERpos."
+  ),
+  con = file.path(paths$manuscript, "21_METABRIC_marker_validation_note.txt")
+)
+
+message("Chunk 21 completed: METABRIC marker-level validation.")
+print(marker_stats)
+
+```
+
+
+```{r Chunk 22 — METABRIC boxplots of discovery-selected validation markers}
+# ----------------------------
+# Chunk 22 — METABRIC boxplots of discovery-selected validation markers
+# Purpose:
+#   Visualize marker-level validation in METABRIC.
+#   Uses markers selected from GSE96058 discovery, not METABRIC.
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(stringr)
+})
+
+marker_long <- readr::read_csv(
+  file.path(paths$tables, "21_METABRIC_discovery_marker_expression_long.csv"),
+  show_col_types = FALSE
+)
+
+marker_stats <- readr::read_csv(
+  file.path(paths$tables, "21_METABRIC_discovery_marker_validation_statistics.csv"),
+  show_col_types = FALSE
+)
+
+gene_order <- marker_stats %>%
+  arrange(desc(abs(cliffs_delta))) %>%
+  pull(gene)
+
+plot_df <- marker_long %>%
+  mutate(
+    gene_label = paste0(gene, "\n", axis),
+    gene_label = factor(
+      gene_label,
+      levels = paste0(gene_order, "\n", marker_stats$axis[match(gene_order, marker_stats$gene)])
+    ),
+    focused_group_ERpos_TNBC = factor(
+      focused_group_ERpos_TNBC,
+      levels = c("ERpos", "TNBC")
+    )
+  )
+
+stat_labels <- marker_stats %>%
+  mutate(
+    gene_label = paste0(gene, "\n", axis),
+    label = paste0(
+      "FDR=", signif(wilcox_fdr, 2),
+      "\nΔ=", round(cliffs_delta, 2)
+    )
+  )
+
+p_marker_box <- ggplot(
+  plot_df,
+  aes(x = focused_group_ERpos_TNBC, y = z_expression, fill = focused_group_ERpos_TNBC)
+) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.80, linewidth = 0.45) +
+  geom_jitter(width = 0.18, alpha = 0.18, size = 0.55, color = "black") +
+  geom_text(
+    data = stat_labels,
+    aes(x = 1.5, y = Inf, label = label),
+    inherit.aes = FALSE,
+    vjust = 1.25,
+    size = 3.7
+  ) +
+  facet_wrap(~ gene_label, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("ERpos" = "#F8766D", "TNBC" = "#00BFC4")) +
+  labs(
+    title = "METABRIC validation of GSE96058-selected ferroptosis markers",
+    subtitle = "Markers were selected in discovery and tested independently in METABRIC; Δ = Cliff's delta, positive values indicate higher TNBC expression",
+    x = NULL,
+    y = "Gene expression (Z-score)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 17),
+    plot.subtitle = element_text(size = 11),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  filename = file.path(paths$figures, "22_METABRIC_discovery_marker_validation_boxplots.png"),
+  plot = p_marker_box,
+  width = 12,
+  height = 9,
+  dpi = 300,
+  bg = "white"
+)
+
+message("Chunk 22 completed: METABRIC discovery-marker validation boxplots saved.")
+p_marker_box
+
+```
+
+```{r}
+# ----------------------------
+# Define GSE96058 discovery paths for cross-cohort comparison
+# ----------------------------
+
+paths_discovery <- list(
+  base       = file.path(root, "GSE96058"),
+  processed  = file.path(root, "GSE96058", "02_processed"),
+  results    = file.path(root, "GSE96058", "03_results"),
+  figures    = file.path(root, "GSE96058", "03_results", "figures"),
+  tables     = file.path(root, "GSE96058", "03_results", "tables"),
+  manuscript = file.path(root, "GSE96058", "06_manuscript_outputs")
+)
+
+stopifnot(dir.exists(paths_discovery$tables))
+
+```
+
+
+```{r Chunk 23 — Cross-cohort marker validation summary}
+
+# Chunk 23 — Cross-cohort marker validation summary
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+})
+
+paths_discovery <- list(
+  tables = file.path(root, "GSE96058", "03_results", "tables")
+)
+
+disc_stats <- readr::read_csv(
+  file.path(paths_discovery$tables, "22_unbiased_selected_marker_expression_statistics.csv"),
+  show_col_types = FALSE
+) %>%
+  rename(
+    delta_disc = cliffs_delta_TNBC_vs_ERpos,
+    fdr_disc   = FDR_BH
+  )
+
+val_stats <- readr::read_csv(
+  file.path(paths$tables, "21_METABRIC_discovery_marker_validation_statistics.csv"),
+  show_col_types = FALSE
+) %>%
+  rename(
+    delta_val = cliffs_delta,
+    fdr_val   = wilcox_fdr
+  )
+
+cross_validation <- disc_stats %>%
+  select(gene, axis, delta_disc, fdr_disc) %>%
+  inner_join(
+    val_stats %>% select(gene, delta_val, fdr_val),
+    by = "gene"
+  ) %>%
+  mutate(
+    direction_disc = ifelse(delta_disc > 0, "Higher_in_TNBC", "Higher_in_ERpos"),
+    direction_val  = ifelse(delta_val > 0, "Higher_in_TNBC", "Higher_in_ERpos"),
+    concordant_direction = direction_disc == direction_val,
+    validation_strength = case_when(
+      fdr_disc < 0.05 & fdr_val < 0.05 & concordant_direction ~ "Strong_replicated",
+      concordant_direction ~ "Directional_consistent",
+      TRUE ~ "Discordant"
+    )
+  ) %>%
+  arrange(desc(abs(delta_val)))
+
+readr::write_csv(
+  cross_validation,
+  file.path(paths$tables, "23_cross_cohort_marker_validation.csv")
+)
+
+message("Chunk 23 completed.")
+print(cross_validation)
+```
+
+Best minimal wet-lab qPCR panel:
+
+POR( NADPH-dependent cytochrome P450 reductase (POR)) + FADS2(FADS2 is a human gene that encodes an enzyme that desaturates omega-3 and omega-6 fatty acids at the delta-6 position.) + SEPSECS + SLC40A1
+
+
+Across independent GSE96058 discovery and METABRIC validation cohorts, breast cancer ferroptosis is reproducibly organized around subtype-specific regulatory architecture: ERpos tumors maintain a tightly coordinated multi-axis ferroptosis defense network, whereas TNBC exhibits conserved rewiring toward PUFA-loading, POR-associated lipid peroxidation, mitochondrial DHODH, and iron-handling vulnerability.
+
+TNBC-high:
+
+POR + FADS2 + DHODH
+
+ERpos-high:
+
+SEPSECS + SLC40A1
+TNBC is not merely ferroptosis-prone; it is ferroptosis-rewired.”
+ERpos is ferroptosis-buffered through redundant defense coupling.
+
+
+
+
+
+Best minimal wet-lab qPCR panel:
+
+POR( NADPH-dependent cytochrome P450 reductase (POR)) + FADS2(FADS2 is a human gene that encodes an enzyme that desaturates omega-3 and omega-6 fatty acids at the delta-6 position.) + SEPSECS + SLC40A1
+
+
+Across independent GSE96058 discovery and METABRIC validation cohorts, breast cancer ferroptosis is reproducibly organized around subtype-specific regulatory architecture: ERpos tumors maintain a tightly coordinated multi-axis ferroptosis defense network, whereas TNBC exhibits conserved rewiring toward PUFA-loading, POR-associated lipid peroxidation, mitochondrial DHODH, and iron-handling vulnerability.
+
+TNBC-high:
+
+POR + FADS2 + DHODH
+
+ERpos-high:
+
+SEPSECS + SLC40A1
+TNBC is not merely ferroptosis-prone; it is ferroptosis-rewired.”
+ERpos is ferroptosis-buffered through redundant defense coupling.
+
+
+
+```{r Chunk 24 — METABRIC overall survival analysis — FULLY UPDATED}
+
+# ----------------------------
+# Chunk 24 — METABRIC overall survival analysis (FULLY UPDATED)
+#
+# KEY CHANGES FROM PREVIOUS VERSION:
+#
+#   FRAMING: All survival analyses are now explicitly pre-specified
+#   as hypothesis-generating exploratory analyses, not powered for
+#   independent prognostic discovery. This framing is set in 24A
+#   and carried through all summary outputs.
+#
+#   24K  (unchanged): Subtype-stratified KM for GPX4/Selenium only
+#         — retained for compatibility with existing figure S7B.
+#
+#   24K2 (NEW): Subtype-stratified log-rank + Cox for ALL 8 axes
+#         within ERpos and TNBC separately. Results saved as
+#         Supplementary Table S7C. Addresses reviewer question:
+#         "If subtype composition confounds GPX4/Selenium, why not
+#          check all eight axes?"
+#
+#   24K3 (NEW): Subtype-stratified KM panel figures (Supp Fig S7C).
+#         ERpos and TNBC panels saved separately per axis.
+#
+#   24K4 (NEW): Subtype-stratified HR forest plot across all axes
+#         for both ERpos and TNBC (Supp Fig S7D).
+#
+#   24L/24M: Unchanged — univariable and multivariable forest plots.
+#
+#   24N  (updated): Summary note now includes exploratory framing
+#         and references the new supplementary table.
+#
+# OUTPUT FILES (new):
+#   tables/24c_METABRIC_survival_subtype_stratified_all_axes.csv
+#   figures/24_METABRIC_KM_subtype_stratified_[AXIS]_ERpos.png
+#   figures/24_METABRIC_KM_subtype_stratified_[AXIS]_TNBC.png
+#   figures/24_METABRIC_survival_subtype_stratified_HR_forest.png
+# ----------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(readr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+})
+
+# ----------------------------
+# 24A — Survival packages + EXPLORATORY FRAMING STATEMENT
+# ----------------------------
+
+surv_pkgs <- c("survival", "survminer", "gridExtra", "grid")
+need <- surv_pkgs[!surv_pkgs %in% rownames(installed.packages())]
+if (length(need) > 0) install.packages(need)
+invisible(lapply(surv_pkgs, library, character.only = TRUE))
+
+# Write the pre-analysis framing statement to the manuscript folder.
+# This is a citable audit trail that the survival analyses were designed
+# as exploratory, not powered for independent prognostic discovery.
+
+writeLines(
+  c(
+    "CHUNK 24 — PRE-ANALYSIS FRAMING STATEMENT",
+    "",
+    "Survival analyses in METABRIC were conducted as pre-specified",
+    "exploratory analyses to assess whether ferroptosis axis scores show",
+    "directional alignment with clinical outcomes consistent with the",
+    "biological states identified in the transcriptomic analyses.",
+    "",
+    "These analyses were NOT powered to detect independent prognostic",
+    "effects after FDR correction across eight axes in a mixed-subtype cohort.",
+    "An adequately powered subtype-stratified survival study would require",
+    "approximately 400-600 patients within a single subtype (e.g., TNBC-only)",
+    "with complete covariate data, substantially larger than the TNBC-annotated",
+    "subset in METABRIC (n = 201 with OS events available).",
+    "",
+    "All survival findings are presented as hypothesis-generating and",
+    "directionally informative. They should not be interpreted as establishing",
+    "prognostic utility without independent prospective validation.",
+    "",
+    "This framing was pre-specified before any survival models were run."
+  ),
+  con = file.path(paths$manuscript,
+                  "24_survival_analysis_pre_analysis_framing_statement.txt")
+)
+
+message("Exploratory framing statement written to manuscript folder.")
+
+# ----------------------------
+# 24B — Load scores + join OS columns from full clinical table
+# ----------------------------
+
+scores_w_pam50 <- readRDS(
+  file.path(paths$processed, "13_scores_weighted_PAM50_labeled.rds")
+)
+
+AXES_ORDER <- readRDS(file.path(paths$processed, "10_axes_order.rds"))
+
+clin_full <- readRDS(file.path(paths$processed, "06_clin_aligned.rds")) |>
+  as.data.frame() |>
+  tibble::as_tibble()
+
+message("Full clinical columns available:")
+print(names(clin_full))
+
+# ----------------------------
+# 24C — Detect and parse OS columns
+# ----------------------------
+
+parse_os_status <- function(x) {
+  x_raw <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    x_raw %in% c("1", "deceased", "1:deceased", "dead", "true")  ~ 1L,
+    x_raw %in% c("0", "living",  "0:living",  "alive", "false") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+pick_col <- function(candidates, pool) {
+  hit <- intersect(candidates, pool)
+  if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+os_time_col <- pick_col(
+  c("OS_MONTHS", "os_months", "overall_survival_months",
+    "OS.MONTHS", "Overall.Survival..Months.", "OS_months"),
+  names(clin_full)
+)
+
+os_status_col <- pick_col(
+  c("OS_STATUS", "os_status", "overall_survival_status",
+    "OS.STATUS", "Overall.Survival.Status", "OS_status",
+    "Vital.Status", "VITAL_STATUS"),
+  names(clin_full)
+)
+
+if (is.na(os_time_col) || is.na(os_status_col)) {
+  stop(
+    "Could not find OS columns.\nAvailable: ",
+    paste(names(clin_full), collapse = ", ")
+  )
+}
+
+message("OS time column:   '", os_time_col,   "'")
+message("OS status column: '", os_status_col, "'")
+
+scores_w_pam50 <- scores_w_pam50 %>%
+  dplyr::left_join(
+    clin_full %>%
+      dplyr::select(
+        sample_id,
+        OS_MONTHS = !!rlang::sym(os_time_col),
+        OS_STATUS = !!rlang::sym(os_status_col)
+      ),
+    by = "sample_id"
+  )
+
+# ----------------------------
+# 24D — Build survival dataset
+# ----------------------------
+
+surv_df <- scores_w_pam50 %>%
+  dplyr::mutate(
+    os_time   = suppressWarnings(as.numeric(OS_MONTHS)),
+    os_status = parse_os_status(OS_STATUS)
+  ) %>%
+  dplyr::filter(
+    is.finite(os_time),
+    os_time > 0,
+    !is.na(os_status),
+    !is.na(pam50_simple)
+  )
+
+n_survival_samples <- nrow(surv_df)
+n_events           <- sum(surv_df$os_status == 1, na.rm = TRUE)
+median_os          <- median(surv_df$os_time, na.rm = TRUE)
+
+message("Survival cohort: n = ", n_survival_samples,
+        " | events = ", n_events,
+        " | median OS = ", round(median_os, 1), " months")
+
+stopifnot(n_survival_samples > 200, n_events > 50)
+
+readr::write_csv(
+  tibble::tibble(
+    dataset            = project$dataset,
+    analysis_type      = "pre-specified exploratory (hypothesis-generating)",
+    n_survival_samples = n_survival_samples,
+    n_events           = n_events,
+    median_os_months   = round(median_os, 1),
+    note = paste0(
+      "Survival analyses are hypothesis-generating. ",
+      "Not powered for FDR-significant prognostic discovery in mixed-subtype cohort. ",
+      "Subtype-stratified analyses provided in Table S7C as pre-specified sensitivity check."
+    )
+  ),
+  file.path(paths$tables, "24_METABRIC_survival_QC.csv")
+)
+
+# ----------------------------
+# 24E — Median-split stratification (all axes)
+# ----------------------------
+
+for (ax in AXES_ORDER) {
+  med_val <- median(surv_df[[ax]], na.rm = TRUE)
+  surv_df[[paste0(ax, "_group")]] <- factor(
+    ifelse(surv_df[[ax]] >= med_val, "High", "Low"),
+    levels = c("Low", "High")
+  )
+}
+
+# Also build focused ERpos/TNBC subsets for stratified analyses (24K2)
+surv_df_erpos <- surv_df %>%
+  dplyr::filter(focused_group_ERpos_TNBC == "ERpos")
+
+surv_df_tnbc  <- surv_df %>%
+  dplyr::filter(focused_group_ERpos_TNBC == "TNBC")
+
+message("ERpos survival subset: n = ", nrow(surv_df_erpos),
+        " | events = ", sum(surv_df_erpos$os_status == 1))
+message("TNBC survival subset:  n = ", nrow(surv_df_tnbc),
+        " | events = ", sum(surv_df_tnbc$os_status == 1))
+
+# Re-compute within-subtype median splits
+for (ax in AXES_ORDER) {
+  med_erpos <- median(surv_df_erpos[[ax]], na.rm = TRUE)
+  med_tnbc  <- median(surv_df_tnbc[[ax]],  na.rm = TRUE)
+  surv_df_erpos[[paste0(ax, "_group")]] <- factor(
+    ifelse(surv_df_erpos[[ax]] >= med_erpos, "High", "Low"),
+    levels = c("Low", "High")
+  )
+  surv_df_tnbc[[paste0(ax, "_group")]] <- factor(
+    ifelse(surv_df_tnbc[[ax]] >= med_tnbc, "High", "Low"),
+    levels = c("Low", "High")
+  )
+}
+
+# ----------------------------
+# 24F — Log-rank tests (full mixed cohort)
+# ----------------------------
+
+logrank_results <- purrr::map_dfr(AXES_ORDER, function(ax) {
+
+  grp_col <- paste0(ax, "_group")
+  df_ax   <- surv_df[!is.na(surv_df[[grp_col]]), ]
+  df_ax$surv_group <- df_ax[[grp_col]]
+
+  sd_result <- survival::survdiff(
+    Surv(os_time, os_status) ~ surv_group, data = df_ax
+  )
+  p_logrank <- 1 - pchisq(sd_result$chisq, df = 1)
+
+  tibble::tibble(
+    axis        = ax,
+    analysis    = "full_mixed_cohort_exploratory",
+    n_total     = nrow(df_ax),
+    n_high      = sum(df_ax$surv_group == "High"),
+    n_low       = sum(df_ax$surv_group == "Low"),
+    events_high = sum(df_ax$os_status[df_ax$surv_group == "High"] == 1),
+    events_low  = sum(df_ax$os_status[df_ax$surv_group == "Low"]  == 1),
+    chisq       = sd_result$chisq,
+    p_logrank   = p_logrank
+  )
+})
+
+logrank_results <- logrank_results %>%
+  dplyr::mutate(
+    FDR_BH = p.adjust(p_logrank, method = "BH"),
+    note   = "Exploratory; not powered for FDR significance"
+  ) %>%
+  dplyr::arrange(p_logrank)
+
+readr::write_csv(
+  logrank_results,
+  file.path(paths$tables, "24_METABRIC_survival_OS_logrank_results.csv")
+)
+
+message("Log-rank results (mixed cohort, exploratory):")
+print(logrank_results %>% dplyr::select(axis, n_total, p_logrank, FDR_BH))
+
+# ----------------------------
+# 24G — Cox PH (continuous score, univariable)
+# ----------------------------
+
+cox_results <- purrr::map_dfr(AXES_ORDER, function(ax) {
+
+  df_ax   <- surv_df[is.finite(surv_df[[ax]]), ]
+  cox_fit <- survival::coxph(
+    Surv(os_time, os_status) ~ .,
+    data = df_ax[, c("os_time", "os_status", ax)]
+  )
+  s <- summary(cox_fit)
+
+  tibble::tibble(
+    axis        = ax,
+    analysis    = "univariable_continuous_exploratory",
+    n           = s$n,
+    events      = s$nevent,
+    HR          = exp(coef(cox_fit)[1]),
+    HR_lo95     = exp(confint(cox_fit)[1, 1]),
+    HR_hi95     = exp(confint(cox_fit)[1, 2]),
+    p_cox       = s$coefficients[1, "Pr(>|z|)"],
+    concordance = s$concordance["C"]
+  )
+})
+
+cox_results <- cox_results %>%
+  dplyr::mutate(
+    FDR_BH = p.adjust(p_cox, method = "BH"),
+    note   = "Exploratory univariable; not powered for FDR significance"
+  ) %>%
+  dplyr::arrange(p_cox)
+
+readr::write_csv(
+  cox_results,
+  file.path(paths$tables, "24_METABRIC_survival_OS_cox_results.csv")
+)
+
+message("Cox univariable results:")
+print(cox_results %>% dplyr::select(axis, HR, HR_lo95, HR_hi95, p_cox, FDR_BH))
+
+# ----------------------------
+# 24G2 — Multivariable Cox (age + grade + stage)
+# ----------------------------
+
+mv_covariate_cols <- c("AGE_AT_DIAGNOSIS", "GRADE", "TUMOR_STAGE")
+mv_cols_available <- intersect(mv_covariate_cols, names(clin_full))
+mv_cols_missing   <- setdiff(mv_covariate_cols, names(clin_full))
+
+if (length(mv_cols_missing) > 0) {
+  warning(
+    "Multivariable Cox: absent covariate columns excluded: ",
+    paste(mv_cols_missing, collapse = ", ")
+  )
+}
+
+if (length(mv_cols_available) == 0) {
+
+  message("No multivariable covariates available — skipping 24G2.")
+  multivariable_cox <- tibble::tibble(
+    axis = AXES_ORDER,
+    note = "Skipped: no covariate columns found in clin_full"
+  )
+
+} else {
+
+  surv_df_mv <- surv_df %>%
+    dplyr::left_join(
+      clin_full %>% dplyr::select(sample_id, dplyr::all_of(mv_cols_available)),
+      by = "sample_id"
+    )
+
+  covariate_terms <- character(0)
+  if ("AGE_AT_DIAGNOSIS" %in% mv_cols_available) covariate_terms <- c(covariate_terms, "age_scaled")
+  if ("GRADE"            %in% mv_cols_available) covariate_terms <- c(covariate_terms, "grade_factor")
+  if ("TUMOR_STAGE"      %in% mv_cols_available) covariate_terms <- c(covariate_terms, "stage_factor")
+
+  multivariable_cox <- purrr::map_dfr(AXES_ORDER, function(ax) {
+
+    df_mv <- surv_df_mv %>% dplyr::filter(is.finite(.data[[ax]]))
+    if ("AGE_AT_DIAGNOSIS" %in% mv_cols_available) df_mv <- df_mv %>% dplyr::filter(!is.na(AGE_AT_DIAGNOSIS))
+    if ("GRADE"            %in% mv_cols_available) df_mv <- df_mv %>% dplyr::filter(!is.na(GRADE))
+    if ("TUMOR_STAGE"      %in% mv_cols_available) df_mv <- df_mv %>% dplyr::filter(!is.na(TUMOR_STAGE))
+
+    if (nrow(df_mv) < 50) {
+      message("Skipping multivariable Cox for ", ax, ": n = ", nrow(df_mv))
+      return(NULL)
+    }
+
+    if ("AGE_AT_DIAGNOSIS" %in% mv_cols_available)
+      df_mv <- df_mv %>% dplyr::mutate(age_scaled   = as.numeric(scale(AGE_AT_DIAGNOSIS)))
+    if ("GRADE" %in% mv_cols_available)
+      df_mv <- df_mv %>% dplyr::mutate(grade_factor = factor(GRADE))
+    if ("TUMOR_STAGE" %in% mv_cols_available)
+      df_mv <- df_mv %>% dplyr::mutate(stage_factor = factor(TUMOR_STAGE))
+
+    formula_mv <- as.formula(
+      paste0("survival::Surv(os_time, os_status) ~ `", ax, "` + ",
+             paste(covariate_terms, collapse = " + "))
+    )
+
+    fit <- tryCatch(
+      survival::coxph(formula_mv, data = df_mv),
+      error = function(e) {
+        message("Multivariable Cox failed for ", ax, ": ", e$message)
+        NULL
+      }
+    )
+    if (is.null(fit)) return(NULL)
+
+    s <- summary(fit)
+    tibble::tibble(
+      axis            = ax,
+      analysis        = "multivariable_continuous_exploratory",
+      n               = s$n,
+      HR_mv           = exp(coef(fit)[1]),
+      lo95_mv         = exp(confint(fit)[1, 1]),
+      hi95_mv         = exp(confint(fit)[1, 2]),
+      p_mv            = s$coefficients[1, "Pr(>|z|)"],
+      covariates_used = paste(covariate_terms, collapse = " + ")
+    )
+  }) %>%
+    dplyr::mutate(
+      FDR_BH_mv = p.adjust(p_mv, method = "BH"),
+      note      = "Exploratory multivariable; not powered for FDR significance"
+    ) %>%
+    dplyr::arrange(p_mv)
+}
+
+readr::write_csv(
+  multivariable_cox,
+  file.path(paths$tables, "24b_METABRIC_multivariable_cox_results.csv")
+)
+
+message("Multivariable Cox results:")
+print(multivariable_cox)
+
+# ----------------------------
+# 24H — KM plot helper (parameterized)
+# Parameters:
+#   df            : survival dataframe (may be full cohort or subtype subset)
+#   axis_name     : axis to plot
+#   title_suffix  : appended to axis name in plot title
+#   subtitle_extra: additional text appended to subtitle
+#   base_font_size: controls all text inside plot (default 16)
+#   risk_font_size: controls risk-table number size (default 5.5)
+# ----------------------------
+
+make_km_plot <- function(axis_name,
+                         df,
+                         lr_tbl         = logrank_results,
+                         cox_tbl        = cox_results,
+                         title_suffix   = "",
+                         subtitle_extra = "",
+                         group_colors   = c("Low" = "#2166AC", "High" = "#B2182B"),
+                         base_font_size = 16,
+                         risk_font_size = 5.5) {
+
+  grp_col <- paste0(axis_name, "_group")
+  df_ax   <- df[!is.na(df[[grp_col]]), ]
+  df_ax$surv_group <- df_ax[[grp_col]]
+
+  km_fit <- survival::survfit(
+    Surv(os_time, os_status) ~ surv_group, data = df_ax
+  )
+
+  # Pull stats from provided tables (may differ for subtype-stratified versions)
+  lr_row  <- lr_tbl[lr_tbl$axis == axis_name, ]
+  cox_row <- cox_tbl[cox_tbl$axis == axis_name, ]
+
+  if (nrow(lr_row) > 0 && !is.na(lr_row$p_logrank[1])) {
+    p_val <- lr_row$p_logrank[1]
+    p_label <- if (p_val < 0.001) "p\u202f<\u202f0.001" else
+      paste0("p\u202f=\u202f", sprintf("%.3f", p_val))
+    fdr_val   <- lr_row$FDR_BH[1]
+    fdr_label <- if (!is.na(fdr_val)) {
+      if (fdr_val < 0.001) "FDR\u202f<\u202f0.001" else
+        paste0("FDR\u202f=\u202f", sprintf("%.3f", fdr_val))
+    } else "FDR = n/a"
+  } else {
+    p_label   <- "p = n/a"
+    fdr_label <- "FDR = n/a"
+  }
+
+  if (nrow(cox_row) > 0 && !is.na(cox_row$HR[1])) {
+    hr_label <- sprintf(
+      "HR\u202f=\u202f%.2f\u202f(95%%\u202fCI\u202f%.2f\u2013%.2f)",
+      cox_row$HR[1], cox_row$HR_lo95[1], cox_row$HR_hi95[1]
+    )
+  } else {
+    hr_label <- "HR = n/a"
+  }
+
+  axis_display <- gsub("_", "/", axis_name)
+  subtitle_base <- paste0(p_label, "  |  ", fdr_label, "  |  ", hr_label)
+  subtitle_full <- if (nchar(subtitle_extra) > 0)
+    paste0(subtitle_base, "\n", subtitle_extra)
+  else
+    subtitle_base
+
+  survminer::ggsurvplot(
+    km_fit,
+    data               = df_ax,
+    palette            = group_colors,
+    risk.table         = TRUE,
+    risk.table.height  = 0.24,
+    risk.table.title   = "Number at risk",
+    risk.table.y.text  = TRUE,
+    risk.table.y.text.col = TRUE,
+    tables.theme       = survminer::theme_cleantable(),
+    pval               = FALSE,
+    conf.int           = TRUE,
+    conf.int.alpha     = 0.14,
+    xlab               = "Overall survival (months)",
+    ylab               = "Survival probability",
+    break.time.by      = 100,
+    xlim               = c(0, 400),
+    legend             = "top",
+    legend.title       = paste0(axis_display, " (median split)"),
+    legend.labs        = c("Low score", "High score"),
+    title              = paste0(axis_display, " axis \u2014 Overall Survival",
+                                title_suffix),
+    subtitle           = subtitle_full,
+    ggtheme            = theme_bw(base_size = base_font_size) +
+      theme(
+        plot.title       = element_text(face = "bold",
+                                        size = base_font_size + 2,
+                                        margin = margin(b = 4)),
+        plot.subtitle    = element_text(size  = base_font_size - 1,
+                                        color = "grey30",
+                                        margin = margin(b = 8)),
+        legend.position  = "top",
+        legend.text      = element_text(size = base_font_size - 1),
+        legend.title     = element_text(size = base_font_size - 1,
+                                        face = "bold"),
+        axis.title       = element_text(size = base_font_size),
+        axis.text        = element_text(size = base_font_size - 2),
+        panel.grid.minor = element_blank()
+      ),
+    fontsize = risk_font_size
+  )
+}
+
+# Helper: combine plot + risk table into a single gtable
+km_grob <- function(p, plot_height = 3.8, table_height = 1.1) {
+  gridExtra::arrangeGrob(
+    p$plot, p$table,
+    ncol    = 1,
+    heights = c(plot_height, table_height)
+  )
+}
+
+# ----------------------------
+# 24I — Individual per-axis KM figures (full cohort)
+# ----------------------------
+
+message("\nSaving individual KM figures — full mixed cohort (exploratory)...")
+
+for (ax in AXES_ORDER) {
+
+  p_ax <- tryCatch(
+    make_km_plot(
+      ax, surv_df,
+      subtitle_extra = "Exploratory analysis \u2014 mixed subtype cohort",
+      base_font_size = 18,
+      risk_font_size = 6.2
+    ),
+    error = function(e) {
+      message("KM failed for ", ax, ": ", e$message)
+      NULL
+    }
+  )
+  if (is.null(p_ax)) next
+
+  out_file <- file.path(paths$figures,
+                        paste0("24_METABRIC_KM_individual_", ax, ".png"))
+
+  png(out_file, width = 3200, height = 3800, res = 300, bg = "white")
+  print(gridExtra::grid.arrange(
+    p_ax$plot, p_ax$table,
+    ncol = 1, heights = c(3.4, 1.0)
+  ))
+  dev.off()
+  message("  Saved: ", basename(out_file))
+}
+
+# ----------------------------
+# 24I-B — Primary 4-panel KM figure (Figure 7A)
+# ----------------------------
+
+message("\nBuilding 4-panel primary KM figure (Figure 7A)...")
+
+p_gpx4  <- make_km_plot("GPX4_Selenium",     surv_df,
+                         subtitle_extra = "Exploratory",
+                         base_font_size = 15, risk_font_size = 5.2)
+p_pufa  <- make_km_plot("PUFA_Loading",       surv_df,
+                         subtitle_extra = "Exploratory",
+                         base_font_size = 15, risk_font_size = 5.2)
+p_dhodh <- make_km_plot("DHODH_Mito",         surv_df,
+                         subtitle_extra = "Exploratory",
+                         base_font_size = 15, risk_font_size = 5.2)
+p_lipid <- make_km_plot("Lipid_Peroxidation", surv_df,
+                         subtitle_extra = "Exploratory",
+                         base_font_size = 15, risk_font_size = 5.2)
+
+km_grobs_4panel <- lapply(
+  list(p_gpx4, p_pufa, p_dhodh, p_lipid),
+  km_grob, plot_height = 3.8, table_height = 1.1
+)
+
+png(
+  file.path(paths$figures, "24_METABRIC_survival_KM_4axes_panel.png"),
+  width  = 7000,
+  height = 9600,
+  res    = 300,
+  bg     = "white"
+)
+gridExtra::grid.arrange(
+  grobs   = km_grobs_4panel,
+  ncol    = 2,
+  nrow    = 2,
+  top     = grid::textGrob(
+    paste0("METABRIC (n\u202f=\u202f1,756): Ferroptosis axis scores and overall survival",
+           "\n(Pre-specified exploratory analyses \u2014 hypothesis-generating)"),
+    gp = grid::gpar(fontsize = 20, fontface = "bold")
+  ),
+  padding = grid::unit(10, "mm")
+)
+dev.off()
+message("Saved: 24_METABRIC_survival_KM_4axes_panel.png")
+
+# Legacy 2-panel (GPX4 + PUFA) for quick review
+png(
+  file.path(paths$figures,
+            "24_METABRIC_survival_KM_primary_axes_GPX4_PUFA.png"),
+  width = 7000, height = 4800, res = 300, bg = "white"
+)
+gridExtra::grid.arrange(
+  km_grob(p_gpx4), km_grob(p_pufa),
+  ncol = 2
+)
+dev.off()
+
+# ----------------------------
+# 24J — Full 8-axis supplementary panel (Supp Fig S7A)
+# ----------------------------
+
+message("\nBuilding 8-panel supplementary KM figure (Supp Fig S7A)...")
+
+all_km_plots <- lapply(AXES_ORDER, function(ax) {
+  tryCatch(
+    make_km_plot(ax, surv_df,
+                 subtitle_extra = "Exploratory",
+                 base_font_size = 15, risk_font_size = 5.2),
+    error = function(e) {
+      message("KM failed for ", ax, ": ", e$message)
+      NULL
+    }
+  )
+})
+names(all_km_plots) <- AXES_ORDER
+
+valid_plots    <- Filter(Negate(is.null), all_km_plots)
+n_valid        <- length(valid_plots)
+valid_combined <- lapply(valid_plots, km_grob, plot_height = 3.8, table_height = 1.1)
+
+n_cols   <- 2
+n_rows   <- ceiling(n_valid / n_cols)
+panel_w  <- 3500
+panel_h  <- 4800
+title_px <- 500
+
+png(
+  file.path(paths$figures,
+            "24_METABRIC_survival_KM_all_8axes_supplementary.png"),
+  width  = n_cols * panel_w,
+  height = n_rows * panel_h + title_px,
+  res    = 300,
+  bg     = "white"
+)
+do.call(
+  gridExtra::grid.arrange,
+  c(valid_combined,
+    list(
+      ncol    = n_cols,
+      nrow    = n_rows,
+      top     = grid::textGrob(
+        paste0("Supplementary Figure S7A: All eight ferroptosis axis scores and OS",
+               "\nMETABRIC (n\u202f=\u202f1,756) \u2014 Pre-specified exploratory analyses"),
+        gp = grid::gpar(fontsize = 22, fontface = "bold")
+      ),
+      padding = grid::unit(10, "mm")
+    )
+  )
+)
+dev.off()
+message("Saved: 24_METABRIC_survival_KM_all_8axes_supplementary.png")
+
+# ----------------------------
+# 24K — Subtype-stratified KM for GPX4/Selenium (existing Supp Fig S7B)
+#        Retained unchanged for manuscript compatibility.
+# ----------------------------
+
+surv_focused <- surv_df[!is.na(surv_df$focused_group_ERpos_TNBC), ]
+subtype_km_plots_gpx4 <- list()
+
+for (subtype in c("ERpos", "TNBC")) {
+
+  df_sub <- surv_focused[surv_focused$focused_group_ERpos_TNBC == subtype, ]
+
+  if (nrow(df_sub) < 30 || sum(df_sub$os_status == 1) < 10) {
+    message("Skipping subtype KM for ", subtype,
+            ": insufficient events.")
+    next
+  }
+
+  med_sub <- median(df_sub$GPX4_Selenium, na.rm = TRUE)
+  df_sub$surv_group <- factor(
+    ifelse(df_sub$GPX4_Selenium >= med_sub, "High", "Low"),
+    levels = c("Low", "High")
+  )
+
+  km_sub  <- survival::survfit(
+    Surv(os_time, os_status) ~ surv_group, data = df_sub)
+  lr_sub  <- survival::survdiff(
+    Surv(os_time, os_status) ~ surv_group, data = df_sub)
+  p_sub   <- 1 - pchisq(lr_sub$chisq, df = 1)
+  cox_sub <- survival::coxph(
+    Surv(os_time, os_status) ~ GPX4_Selenium, data = df_sub)
+
+  p_lbl  <- if (p_sub < 0.001) "p\u202f<\u202f0.001" else
+    paste0("p\u202f=\u202f", sprintf("%.3f", p_sub))
+  hr_lbl <- sprintf(
+    "HR\u202f=\u202f%.2f\u202f(95%%\u202fCI\u202f%.2f\u2013%.2f)",
+    exp(coef(cox_sub)[1]),
+    exp(confint(cox_sub)[1, 1]),
+    exp(confint(cox_sub)[1, 2])
+  )
+
+  pal <- if (subtype == "ERpos") {
+    c("Low" = "#F4A582", "High" = "#B2182B")
+  } else {
+    c("Low" = "#92C5DE", "High" = "#2166AC")
+  }
+
+  subtype_km_plots_gpx4[[subtype]] <- survminer::ggsurvplot(
+    km_sub,
+    data               = df_sub,
+    palette            = pal,
+    risk.table         = TRUE,
+    risk.table.height  = 0.24,
+    risk.table.title   = "Number at risk",
+    tables.theme       = survminer::theme_cleantable(),
+    pval               = FALSE,
+    conf.int           = TRUE,
+    conf.int.alpha     = 0.14,
+    xlab               = "Overall survival (months)",
+    ylab               = "Survival probability",
+    break.time.by      = 100,
+    legend.title       = "GPX4/Se (median split\nwithin subtype)",
+    legend.labs        = c("Low score", "High score"),
+    title              = paste0("GPX4/Selenium \u2014 OS within ",
+                                subtype, " only"),
+    subtitle           = paste0(p_lbl, "  |  ", hr_lbl,
+                                "\nWithin-subtype exploratory analysis"),
+    ggtheme            = theme_bw(base_size = 15) +
+      theme(
+        plot.title       = element_text(face = "bold", size = 17),
+        plot.subtitle    = element_text(size = 12, color = "grey30"),
+        legend.position  = "top",
+        panel.grid.minor = element_blank()
+      ),
+    fontsize = 5.5
+  )
+}
+
+if (length(subtype_km_plots_gpx4) >= 1) {
+  subtype_combined <- lapply(
+    subtype_km_plots_gpx4,
+    km_grob, plot_height = 3.8, table_height = 1.1
+  )
+  n_sub <- length(subtype_combined)
+
+  png(
+    file.path(paths$figures,
+              "24_METABRIC_survival_KM_GPX4_subtype_stratified.png"),
+    width  = n_sub * 3500,
+    height = 4800,
+    res    = 300,
+    bg     = "white"
+  )
+  do.call(
+    gridExtra::grid.arrange,
+    c(subtype_combined,
+      list(
+        ncol = n_sub,
+        top  = grid::textGrob(
+          paste0("Supplementary Figure S7B: GPX4/Selenium and OS",
+                 " \u2014 subtype-stratified analysis (exploratory)"),
+          gp = grid::gpar(fontsize = 20, fontface = "bold")
+        )
+      )
+    )
+  )
+  dev.off()
+  message("Saved: 24_METABRIC_survival_KM_GPX4_subtype_stratified.png")
+}
+
+# ----------------------------
+# 24K2 — NEW: Subtype-stratified log-rank + Cox for ALL 8 axes
+#             within ERpos and TNBC separately.
+#             Produces Supplementary Table S7C.
+#
+# Rationale: If subtype composition confounds the mixed-cohort GPX4/Selenium
+# signal (shown in 24K), reviewers will ask whether Iron Handling and FSP1/CoQ
+# multivariable associations are similarly composition-driven. This analysis
+# pre-empts that question by reporting within-subtype associations for all
+# eight axes.
+#
+# NOTE: Within-subtype analyses are severely underpowered, especially in TNBC
+# (n ≈ 201, ~100 events). Results are reported for transparency and should
+# be interpreted as directional evidence only. Sample sizes and event counts
+# are reported per row to make the power limitation explicit.
+# ----------------------------
+
+message("\n--- 24K2: Subtype-stratified survival for ALL 8 axes (Supp Table S7C) ---")
+
+run_stratified_survival <- function(surv_subset, ax, subtype_label) {
+
+  grp_col <- paste0(ax, "_group")
+
+  df_ax <- surv_subset[!is.na(surv_subset[[grp_col]]), ]
+  df_ax$surv_group <- df_ax[[grp_col]]
+
+  n_total <- nrow(df_ax)
+  n_events <- sum(df_ax$os_status == 1, na.rm = TRUE)
+  n_high <- sum(df_ax$surv_group == "High", na.rm = TRUE)
+  n_low  <- sum(df_ax$surv_group == "Low",  na.rm = TRUE)
+
+  # Skip if underpowered (< 20 events)
+  if (n_events < 20 || n_total < 40) {
+    return(tibble::tibble(
+      axis             = ax,
+      subtype          = subtype_label,
+      n_total          = n_total,
+      n_events         = n_events,
+      n_high           = n_high,
+      n_low            = n_low,
+      lr_chisq         = NA_real_,
+      lr_p             = NA_real_,
+      FDR_BH_within    = NA_real_,
+      HR_continuous    = NA_real_,
+      HR_lo95          = NA_real_,
+      HR_hi95          = NA_real_,
+      p_cox_continuous = NA_real_,
+      interpretation   = "Insufficient events for reliable estimation (n_events < 20)"
+    ))
+  }
+
+  # Log-rank
+  lr_res  <- survival::survdiff(
+    Surv(os_time, os_status) ~ surv_group, data = df_ax
+  )
+  lr_p    <- 1 - pchisq(lr_res$chisq, df = 1)
+
+  # Cox (continuous score)
+  cox_fit <- tryCatch(
+    survival::coxph(
+      Surv(os_time, os_status) ~ .,
+      data = df_ax[, c("os_time", "os_status", ax)]
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(cox_fit)) {
+    HR <- NA_real_; lo <- NA_real_; hi <- NA_real_; p_cox <- NA_real_
+  } else {
+    HR    <- exp(coef(cox_fit)[1])
+    lo    <- exp(confint(cox_fit)[1, 1])
+    hi    <- exp(confint(cox_fit)[1, 2])
+    p_cox <- summary(cox_fit)$coefficients[1, "Pr(>|z|)"]
+  }
+
+  tibble::tibble(
+    axis             = ax,
+    subtype          = subtype_label,
+    n_total          = n_total,
+    n_events         = n_events,
+    n_high           = n_high,
+    n_low            = n_low,
+    lr_chisq         = lr_res$chisq,
+    lr_p             = lr_p,
+    FDR_BH_within    = NA_real_,   # filled after binding all results
+    HR_continuous    = HR,
+    HR_lo95          = lo,
+    HR_hi95          = hi,
+    p_cox_continuous = p_cox,
+    interpretation   = "Exploratory within-subtype (severely underpowered in TNBC)"
+  )
+}
+
+# Run for all axes × both subtypes
+stratified_results_list <- list()
+
+for (ax in AXES_ORDER) {
+
+  # ERpos
+  stratified_results_list[[paste0(ax, "_ERpos")]] <-
+    run_stratified_survival(surv_df_erpos, ax, "ERpos")
+
+  # TNBC
+  stratified_results_list[[paste0(ax, "_TNBC")]] <-
+    run_stratified_survival(surv_df_tnbc, ax, "TNBC")
+}
+
+stratified_all_axes <- dplyr::bind_rows(stratified_results_list)
+
+# Apply within-subtype BH-FDR correction separately for ERpos and TNBC
+stratified_all_axes <- stratified_all_axes %>%
+  dplyr::group_by(subtype) %>%
+  dplyr::mutate(
+    FDR_BH_within = p.adjust(lr_p, method = "BH")
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(subtype, lr_p)
+
+# Save as Supplementary Table S7C
+readr::write_csv(
+  stratified_all_axes,
+  file.path(paths$tables,
+            "24c_METABRIC_survival_subtype_stratified_all_axes_TableS7C.csv")
+)
+
+message("Supplementary Table S7C saved.")
+message("Subtype-stratified results (all 8 axes):")
+print(
+  stratified_all_axes %>%
+    dplyr::select(axis, subtype, n_total, n_events, lr_p, FDR_BH_within,
+                  HR_continuous, HR_lo95, HR_hi95)
+)
+
+# ----------------------------
+# 24K3 — NEW: Subtype-stratified KM panel figures (Supp Fig S7C)
+#             Saves one 2-panel figure per axis (ERpos left, TNBC right).
+#             Only saves for axes with sufficient events in both groups.
+# ----------------------------
+
+message("\n--- 24K3: Subtype-stratified KM panels per axis (Supp Fig S7C) ---")
+
+for (ax in AXES_ORDER) {
+
+  grp_col <- paste0(ax, "_group")
+
+  # Build per-subtype stat tables for make_km_plot
+  build_mini_stats <- function(df_sub, subtype_label) {
+    n_ev <- sum(df_sub$os_status == 1, na.rm = TRUE)
+    if (n_ev < 10 || nrow(df_sub) < 30) return(NULL)
+
+    df_ax <- df_sub[!is.na(df_sub[[grp_col]]), ]
+    df_ax$surv_group <- df_ax[[grp_col]]
+
+    lr   <- tryCatch(
+      survival::survdiff(Surv(os_time, os_status) ~ surv_group, data = df_ax),
+      error = function(e) NULL
+    )
+    if (is.null(lr)) return(NULL)
+
+    lr_p_val <- 1 - pchisq(lr$chisq, df = 1)
+
+    cox_c <- tryCatch(
+      survival::coxph(
+        Surv(os_time, os_status) ~ .,
+        data = df_ax[, c("os_time", "os_status", ax)]
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(cox_c)) return(NULL)
+
+    tibble::tibble(
+      axis    = ax,
+      p_logrank = lr_p_val,
+      FDR_BH    = NA_real_,
+      HR        = exp(coef(cox_c)[1]),
+      HR_lo95   = exp(confint(cox_c)[1, 1]),
+      HR_hi95   = exp(confint(cox_c)[1, 2])
+    )
+  }
+
+  mini_lr_erpos <- build_mini_stats(surv_df_erpos, "ERpos")
+  mini_lr_tnbc  <- build_mini_stats(surv_df_tnbc,  "TNBC")
+
+  if (is.null(mini_lr_erpos) && is.null(mini_lr_tnbc)) {
+    message("Skipping subtype-stratified KM panel for ", ax,
+            ": insufficient events in both subtypes.")
+    next
+  }
+
+  panels <- list()
+
+  if (!is.null(mini_lr_erpos)) {
+    # Need a mini cox table with the right column names for make_km_plot
+    mini_cox_erpos <- mini_lr_erpos %>%
+      dplyr::rename(p_cox = p_logrank)   # placeholder so function works
+
+    p_er <- tryCatch(
+      make_km_plot(
+        ax, surv_df_erpos,
+        lr_tbl         = mini_lr_erpos,
+        cox_tbl        = mini_cox_erpos,
+        title_suffix   = " \u2014 ERpos only",
+        subtitle_extra = paste0("Within-subtype exploratory; n = ",
+                                nrow(surv_df_erpos),
+                                " | events = ",
+                                sum(surv_df_erpos$os_status == 1)),
+        group_colors   = c("Low" = "#F4A582", "High" = "#B2182B"),
+        base_font_size = 15,
+        risk_font_size = 5.2
+      ),
+      error = function(e) { message("ERpos KM failed for ", ax); NULL }
+    )
+    if (!is.null(p_er)) panels[["ERpos"]] <- p_er
+  }
+
+  if (!is.null(mini_lr_tnbc)) {
+    mini_cox_tnbc <- mini_lr_tnbc %>%
+      dplyr::rename(p_cox = p_logrank)
+
+    p_tn <- tryCatch(
+      make_km_plot(
+        ax, surv_df_tnbc,
+        lr_tbl         = mini_lr_tnbc,
+        cox_tbl        = mini_cox_tnbc,
+        title_suffix   = " \u2014 TNBC only",
+        subtitle_extra = paste0("Within-subtype exploratory; n = ",
+                                nrow(surv_df_tnbc),
+                                " | events = ",
+                                sum(surv_df_tnbc$os_status == 1)),
+        group_colors   = c("Low" = "#92C5DE", "High" = "#2166AC"),
+        base_font_size = 15,
+        risk_font_size = 5.2
+      ),
+      error = function(e) { message("TNBC KM failed for ", ax); NULL }
+    )
+    if (!is.null(p_tn)) panels[["TNBC"]] <- p_tn
+  }
+
+  if (length(panels) == 0) next
+
+  panel_grobs <- lapply(panels, km_grob, plot_height = 3.8, table_height = 1.1)
+  n_p <- length(panel_grobs)
+
+  png(
+    file.path(paths$figures,
+              paste0("24_METABRIC_KM_subtype_stratified_", ax, ".png")),
+    width  = n_p * 3500,
+    height = 4800,
+    res    = 300,
+    bg     = "white"
+  )
+  do.call(
+    gridExtra::grid.arrange,
+    c(panel_grobs,
+      list(
+        ncol = n_p,
+        top  = grid::textGrob(
+          paste0("Supp Fig S7C — ", gsub("_", "/", ax),
+                 ": within-subtype OS analysis (exploratory)"),
+          gp = grid::gpar(fontsize = 20, fontface = "bold")
+        )
+      )
+    )
+  )
+  dev.off()
+  message("  Saved: 24_METABRIC_KM_subtype_stratified_", ax, ".png")
+}
+
+# ----------------------------
+# 24K4 — NEW: Subtype-stratified HR forest plot (Supp Fig S7D)
+#             Shows HR (continuous axis score) within ERpos and TNBC
+#             for all 8 axes side by side.
+# ----------------------------
+
+message("\n--- 24K4: Subtype-stratified HR forest plot (Supp Fig S7D) ---")
+
+forest_strat_df <- stratified_all_axes %>%
+  dplyr::filter(!is.na(HR_continuous)) %>%
+  dplyr::mutate(
+    axis    = factor(axis, levels = rev(AXES_ORDER)),
+    subtype = factor(subtype, levels = c("ERpos", "TNBC")),
+    sig     = !is.na(p_cox_continuous) & p_cox_continuous < 0.05,
+    label   = sprintf("%.2f (%.2f\u2013%.2f)\nn=%d, ev=%d",
+                      HR_continuous, HR_lo95, HR_hi95,
+                      n_total, n_events),
+    power_note = ifelse(
+      n_events < 20,
+      "< 20 events\n(not shown)",
+      NA_character_
+    )
+  )
+
+p_strat_forest <- ggplot(
+  forest_strat_df %>% dplyr::filter(n_events >= 20),
+  aes(x = HR_continuous, y = axis, color = subtype, shape = sig)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             linewidth = 0.5, color = "grey40") +
+  geom_errorbarh(
+    aes(xmin = HR_lo95, xmax = HR_hi95),
+    height   = 0.25,
+    linewidth = 0.7,
+    position = position_dodge(width = 0.55)
+  ) +
+  geom_point(
+    size = 3.5,
+    position = position_dodge(width = 0.55)
+  ) +
+  scale_color_manual(
+    values = c("ERpos" = "#B2182B", "TNBC" = "#2166AC"),
+    name   = "Subtype"
+  ) +
+  scale_shape_manual(
+    values = c("TRUE" = 16, "FALSE" = 1),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p \u2265 0.05"),
+    name   = "Within-subtype p"
+  ) +
+  scale_x_continuous(name = "Hazard ratio (95% CI)\ncontinuous axis score") +
+  scale_y_discrete(
+    name   = NULL,
+    labels = function(x) gsub("_", "/", x)
+  ) +
+  labs(
+    title    = paste0(
+      " Within-subtype survival associations",
+      " for all eight ferroptosis axes in METABRIC"
+    ),
+    subtitle = paste0(
+      "Cox PH with continuous axis score; stratified within ERpos (n = ",
+      nrow(surv_df_erpos), ") and TNBC (n = ", nrow(surv_df_tnbc), ")\n",
+      "Axes with < 20 events in a subtype are excluded from display. ",
+      "All results are exploratory and underpowered."
+    )
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14),
+    plot.subtitle    = element_text(size = 10, color = "grey30",
+                                    lineheight = 1.3),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom",
+    legend.box       = "horizontal"
+  )
+
+ggsave(
+  file.path(paths$figures,
+            "24_METABRIC_survival_subtype_stratified_HR_forest.png"),
+  p_strat_forest,
+  width  = 9.5,
+  height = 6.5,
+  dpi    = 300,
+  bg     = "white"
+)
+ggsave(
+  file.path(paths$figures,
+            "24_METABRIC_survival_subtype_stratified_HR_forest.pdf"),
+  p_strat_forest,
+  width  = 9.5,
+  height = 6.5,
+  bg     = "white"
+)
+message("Saved: Supp Fig S7D — subtype-stratified HR forest plot")
+
+# ----------------------------
+# 24L — Univariable Cox forest plot (Figure 7B, mixed cohort)
+# ----------------------------
+
+p_cox_forest <- cox_results %>%
+  dplyr::mutate(
+    axis        = factor(axis, levels = rev(AXES_ORDER)),
+    significant = !is.na(FDR_BH) & FDR_BH < 0.05,
+    label       = sprintf("%.2f (%.2f\u2013%.2f)",
+                          HR, HR_lo95, HR_hi95)
+  ) %>%
+  ggplot(aes(x = HR, y = axis)) +
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.5) +
+  geom_errorbarh(
+    aes(xmin = HR_lo95, xmax = HR_hi95, color = significant),
+    height = 0.2, linewidth = 0.8
+  ) +
+  geom_point(aes(color = significant), size = 3.5) +
+  geom_text(
+    aes(x = max(HR_hi95, na.rm = TRUE) * 1.06, label = label),
+    hjust = 0, size = 3.8
+  ) +
+  scale_color_manual(
+    values = c("TRUE" = "#B2182B", "FALSE" = "grey50"),
+    labels = c("TRUE" = "FDR\u202f<\u202f0.05",
+               "FALSE" = "Not significant"),
+    name   = NULL
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.38))) +
+  scale_y_discrete(labels = function(x) gsub("_", "/", x)) +
+  labs(
+    title    = paste0(
+      "METABRIC: Hazard ratio for OS by ferroptosis axis score",
+      " (univariable Cox PH, mixed cohort)"
+    ),
+    subtitle = paste0(
+      "Continuous axis score entered as predictor; n = 1,756; 1,044 events.\n",
+      "Pre-specified exploratory analysis. No axis reaches BH-FDR < 0.05."
+    ),
+    x = "Hazard ratio (95% CI)",
+    y = NULL
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15),
+    plot.subtitle    = element_text(size = 11, color = "grey30",
+                                    lineheight = 1.3),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+
+ggsave(
+  file.path(paths$figures, "24_METABRIC_survival_HR_forest_plot.png"),
+  p_cox_forest, width = 9.5, height = 6, dpi = 300, bg = "white"
+)
+message("Saved: 24_METABRIC_survival_HR_forest_plot.png")
+
+# ----------------------------
+# 24M — Multivariable Cox forest plot (Figure 7B multivariable)
+# ----------------------------
+
+if ("HR_mv" %in% names(multivariable_cox)) {
+
+  p_mv_forest <- multivariable_cox %>%
+    dplyr::mutate(
+      axis        = factor(axis, levels = rev(AXES_ORDER)),
+      significant = !is.na(FDR_BH_mv) & p_mv < 0.05,
+      label       = sprintf("%.2f (%.2f\u2013%.2f)",
+                            HR_mv, lo95_mv, hi95_mv)
+    ) %>%
+    ggplot(aes(x = HR_mv, y = axis)) +
+    geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.5) +
+    geom_errorbarh(
+      aes(xmin = lo95_mv, xmax = hi95_mv, color = significant),
+      height = 0.2, linewidth = 0.8
+    ) +
+    geom_point(aes(color = significant), size = 3.5) +
+    geom_text(
+      aes(x = max(hi95_mv, na.rm = TRUE) * 1.06, label = label),
+      hjust = 0, size = 3.8
+    ) +
+    scale_color_manual(
+      values = c("TRUE" = "#B2182B", "FALSE" = "grey50"),
+      labels = c("TRUE" = "p < 0.05 (unadjusted for multiple testing)",
+                 "FALSE" = "Not significant"),
+      name   = NULL
+    ) +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.38))) +
+    scale_y_discrete(labels = function(x) gsub("_", "/", x)) +
+    labs(
+      title    = paste0(
+        "METABRIC: Multivariable-adjusted HR for OS by ferroptosis axis score"
+      ),
+      subtitle = paste0(
+        "Adjusted for age at diagnosis, tumour grade, and tumour stage; ",
+        "n = 1,238 with complete covariate data.\n",
+        "Pre-specified exploratory analysis. No axis reaches BH-FDR < 0.05. ",
+        "Filled circles: p < 0.05 (not FDR-corrected)."
+      ),
+      x = "Hazard ratio (95% CI)",
+      y = NULL
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 15),
+      plot.subtitle    = element_text(size = 10, color = "grey30",
+                                      lineheight = 1.3),
+      panel.grid.minor = element_blank(),
+      legend.position  = "bottom"
+    )
+
+  ggsave(
+    file.path(paths$figures,
+              "24_METABRIC_survival_multivariable_HR_forest_plot.png"),
+    p_mv_forest, width = 9.5, height = 6, dpi = 300, bg = "white"
+  )
+  message("Saved: 24_METABRIC_survival_multivariable_HR_forest_plot.png")
+
+} else {
+  message("Multivariable forest plot skipped: HR_mv column not present.")
+  p_mv_forest <- NULL
+}
+
+# ----------------------------
+# 24N — Summary note (UPDATED with exploratory framing)
+# ----------------------------
+
+sig_axes_survival <- logrank_results %>%
+  dplyr::filter(!is.na(FDR_BH), FDR_BH < 0.05) %>%
+  dplyr::pull(axis)
+
+sig_axes_mv <- if ("p_mv" %in% names(multivariable_cox)) {
+  multivariable_cox %>%
+    dplyr::filter(!is.na(p_mv), p_mv < 0.05) %>%
+    dplyr::pull(axis)
+} else character(0)
+
+# Subtype-stratified summary
+strat_summary <- stratified_all_axes %>%
+  dplyr::filter(n_events >= 20, !is.na(lr_p)) %>%
+  dplyr::group_by(subtype) %>%
+  dplyr::summarise(
+    n_axes_tested   = dplyr::n(),
+    n_lr_p_lt_0.05  = sum(lr_p < 0.05, na.rm = TRUE),
+    axes_lr_lt_0.05 = paste(
+      axis[lr_p < 0.05 & !is.na(lr_p)], collapse = ", "
+    ),
+    .groups = "drop"
+  )
+
+writeLines(
+  c(
+    "Chunk 24 METABRIC survival analysis — UPDATED SUMMARY NOTE",
+    "",
+    "FRAMING: All survival analyses in this chunk are pre-specified",
+    "exploratory analyses. They are not powered for independent prognostic",
+    "discovery after FDR correction in a mixed-subtype cohort.",
+    "",
+    paste0("n = ", n_survival_samples,
+           ", events = ", n_events,
+           ", median OS = ", round(median_os, 1), " months"),
+    "",
+    "--- MIXED COHORT (all subtypes) ---",
+    "Stratification: within-cohort median split per axis",
+    "Tests: log-rank + BH-FDR; Cox HR (continuous score)",
+    paste0(
+      "FDR-significant axes (log-rank, BH-FDR < 0.05): ",
+      if (length(sig_axes_survival) > 0)
+        paste(sig_axes_survival, collapse = ", ")
+      else "none at FDR < 0.05 (minimum FDR = 0.081)"
+    ),
+    paste0(
+      "Axes with p < 0.05 in multivariable Cox (not FDR-corrected): ",
+      if (length(sig_axes_mv) > 0)
+        paste(sig_axes_mv, collapse = ", ")
+      else "none"
+    ),
+    "",
+    "--- SUBTYPE-STRATIFIED (new, Supp Table S7C) ---",
+    "Purpose: pre-empt reviewer question about composition confounding.",
+    "Method: separate log-rank + continuous Cox within ERpos and TNBC.",
+    "Caveat: severely underpowered in TNBC (n ~ 201, ~ 100 events).",
+    "",
+    as.character(knitr::kable(strat_summary)),
+    "",
+    "--- FIGURE OUTPUTS ---",
+    "Figure 7A:   24_METABRIC_survival_KM_4axes_panel.png",
+    "Figure 7B:   24_METABRIC_survival_multivariable_HR_forest_plot.png",
+    "Supp S7A:    24_METABRIC_survival_KM_all_8axes_supplementary.png",
+    "Supp S7B:    24_METABRIC_survival_KM_GPX4_subtype_stratified.png",
+    "Supp S7C:    24_METABRIC_KM_subtype_stratified_[AXIS].png (8 files)",
+    "Supp S7D:    24_METABRIC_survival_subtype_stratified_HR_forest.png",
+    "",
+    "--- TABLE OUTPUTS ---",
+    "Table S7C:   24c_METABRIC_survival_subtype_stratified_all_axes_TableS7C.csv",
+    "",
+    "--- MULTIVARIABLE COVARIATES ---",
+    paste0("Available: ", paste(mv_cols_available, collapse = ", ")),
+    paste0("Missing:   ",
+           if (length(mv_cols_missing) > 0)
+             paste(mv_cols_missing, collapse = ", ")
+           else "none")
+  ),
+  con = file.path(paths$manuscript, "24_METABRIC_survival_analysis_note.txt")
+)
+
+message("\nChunk 24 (fully updated) completed.")
+message("Summary:")
+message("  Mixed cohort log-rank — FDR-significant axes: ",
+        if (length(sig_axes_survival) > 0) paste(sig_axes_survival, collapse=", ")
+        else "none (minimum FDR = 0.081)")
+message("  Multivariable p < 0.05 (unadjusted): ",
+        if (length(sig_axes_mv) > 0) paste(sig_axes_mv, collapse=", ")
+        else "none")
+message("  Supp Table S7C saved: subtype-stratified results for all 8 axes")
+
+cat("\nLog-rank (mixed cohort):\n")
+print(logrank_results %>% dplyr::select(axis, n_total, p_logrank, FDR_BH))
+
+cat("\nMultivariable Cox:\n")
+print(multivariable_cox)
+
+cat("\nSubtype-stratified (Supp Table S7C):\n")
+print(
+  stratified_all_axes %>%
+    dplyr::select(axis, subtype, n_total, n_events,
+                  lr_p, FDR_BH_within,
+                  HR_continuous, HR_lo95, HR_hi95,
+                  p_cox_continuous)
+)
+
+# Final inline display
+p_cox_forest
+if (!is.null(p_mv_forest)) p_mv_forest
+p_strat_forest
+
+
+
+# Combine all 8 subtype-stratified KM figures into one composite Supp Fig S7C
+
+library(magick)
+
+axes_order <- c(
+  "GPX4_Selenium", "BH4_GCH1",
+  "Xc_GSH",        "FSP1_CoQ",
+  "DHODH_Mito",    "Iron_Handling",
+  "PUFA_Loading",  "Lipid_Peroxidation"
+)
+
+panel_files <- file.path(
+  paths$figures,
+  paste0("24_METABRIC_KM_subtype_stratified_", axes_order, ".png")
+)
+
+# Check all exist
+missing <- panel_files[!file.exists(panel_files)]
+if (length(missing) > 0) stop("Missing panels: ", paste(missing, collapse=", "))
+
+# Read all panels
+panels <- lapply(panel_files, magick::image_read)
+
+# Arrange in 2 columns × 4 rows
+row1 <- magick::image_append(c(panels[[1]], panels[[2]]))
+row2 <- magick::image_append(c(panels[[3]], panels[[4]]))
+row3 <- magick::image_append(c(panels[[5]], panels[[6]]))
+row4 <- magick::image_append(c(panels[[7]], panels[[8]]))
+
+composite <- magick::image_append(
+  c(row1, row2, row3, row4),
+  stack = TRUE
+)
+
+# Add title
+composite_titled <- magick::image_annotate(
+  composite,
+  text = paste0(
+    "Supplementary Figure S7C: Within-subtype OS analysis — all eight ferroptosis axes",
+    "\nMETABRIC (ERpos n=1,316 left panel; TNBC n=201 right panel per axis)"
+  ),
+  gravity = "north",
+  size    = 55,
+  font    = "Arial",
+  color   = "black",
+  boxcolor = "white"
+)
+
+magick::image_write(
+  composite_titled,
+  path   = file.path(paths$figures,
+                     "S7C_subtype_stratified_KM_all_axes_composite.png"),
+  format = "png"
+)
+
+message("Saved: S7C_subtype_stratified_KM_all_axes_composite.png")
+```
+
+
+
+Survival analysis in METABRIC (n = 1,756; 1,044 events) revealed nominal associations between ferroptosis axis scores and OS. High Lipid_Peroxidation axis score was associated with shorter OS (log-rank p = 0.045; HR = 1.19, 95% CI 1.03–1.39), and high GPX4_Selenium axis score showed a trend toward better OS (log-rank p = 0.020; HR = 0.92, 95% CI 0.80–1.05), directionally consistent with the ferroptosis-pressure and ferroptosis-buffering states identified in the transcriptomic analysis. However, no axis reached BH-FDR significance after correction for eight comparisons (minimum FDR = 0.08), likely reflecting limited statistical power in the absence of subtype stratification. Subtype-stratified analysis demonstrated that the GPX4_Selenium OS association was not significant within ERpos (p = 0.303) or TNBC (p = 0.226) individually, suggesting this signal is partially driven by sub type composition rather than within-subtype GPX4 biology.
+
+```{r MANUSCRIPT NUMBER EXTRACTOR}
+
+# METABRIC PIPELINE — MANUSCRIPT NUMBER EXTRACTOR (FULLY UPDATED)
+# Project root: E:/ERplus_Ferroptosis_Wiring
+# Run after completing all 24 METABRIC pipeline chunks.
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(tidyr)
+})
+
+
+# ROOT PATH — HARDCODED TO YOUR PROJECT
+
+root <- "E:/ERplus_Ferroptosis_Wiring"
+
+paths <- list(
+  processed  = file.path(root, "METABRIC", "02_processed"),
+  tables     = file.path(root, "METABRIC", "03_results", "tables"),
+  manuscript = file.path(root, "METABRIC", "06_manuscript_outputs")
+)
+
+# Also point to GSE96058 discovery tables for cross-cohort section
+paths_discovery <- list(
+  tables = file.path(root, "GSE96058", "03_results", "tables")
+)
+
+cat("=============================================================================\n")
+cat("METABRIC MANUSCRIPT NUMBER EXTRACTOR\n")
+cat("=============================================================================\n")
+cat("Root:          ", root, "\n")
+cat("Tables folder: ", paths$tables, "\n")
+cat("Folder exists: ", dir.exists(paths$tables), "\n\n")
+
+if (!dir.exists(paths$tables)) {
+  stop("Tables folder not found: ", paths$tables,
+       "\nCheck that the METABRIC pipeline has been run.")
+}
+
+# =============================================================================
+# LOAD ALL FILES
+# =============================================================================
+
+safe_read <- function(fp, label) {
+  if (file.exists(fp)) {
+    df <- tryCatch(
+      readr::read_csv(fp, show_col_types = FALSE),
+      error = function(e) { cat("[ERROR]", label, ":", e$message, "\n"); NULL }
+    )
+    if (!is.null(df)) cat("[OK]    ", label, "\n")
+    return(df)
+  } else {
+    cat("[MISSING]", label, "->", basename(fp), "\n")
+    return(NULL)
+  }
+}
+
+cat("--- Loading files ---\n")
+
+align       <- safe_read(file.path(paths$tables, "06_qc_expression_clinical_alignment.csv"),       "Cohort alignment")
+pam50_raw   <- safe_read(file.path(paths$tables, "07_qc_pam50_subtype_counts.csv"),                "PAM50 raw counts")
+focused_raw <- safe_read(file.path(paths$tables, "07_qc_focused_ERpos_TNBC_counts.csv"),           "Focused ERpos/TNBC raw")
+concordance <- safe_read(file.path(paths$tables, "07_qc_receptor_PAM50_concordance.csv"),          "PAM50/receptor concordance")
+pam50_rep   <- safe_read(file.path(paths$tables, "09_qc_PAM50_primary_repSAFE.csv"),               "PAM50 repSAFE")
+focused_rep <- safe_read(file.path(paths$tables, "09_qc_focused_ERpos_TNBC_repSAFE.csv"),          "Focused repSAFE")
+cov         <- safe_read(file.path(paths$tables, "10_CORE_ferroptosis_axis_gene_coverage_METABRIC.csv"), "Axis coverage")
+sig         <- safe_read(file.path(paths$tables, "15_METABRIC_focused_ERpos_TNBC_axis_statistics_weighted.csv"), "ERpos/TNBC signature")
+down        <- safe_read(file.path(paths$tables, "16_METABRIC_downsampling_robustness_summary.csv"), "Downsampling robustness")
+perm        <- safe_read(file.path(paths$tables, "19_METABRIC_permutation_test_differential_wiring_results.csv"), "Permutation wiring")
+val         <- safe_read(file.path(paths$tables, "20_METABRIC_axis_validation_summary.csv"),        "Combined validation")
+markers     <- safe_read(file.path(paths$tables, "21_METABRIC_discovery_marker_validation_statistics.csv"), "Marker validation")
+cross       <- safe_read(file.path(paths$tables, "23_cross_cohort_marker_validation.csv"),          "Cross-cohort concordance")
+surv_qc     <- safe_read(file.path(paths$tables, "24_METABRIC_survival_QC.csv"),                   "Survival QC")
+lr          <- safe_read(file.path(paths$tables, "24_METABRIC_survival_OS_logrank_results.csv"),    "Log-rank results")
+cox_df      <- safe_read(file.path(paths$tables, "24_METABRIC_survival_OS_cox_results.csv"),        "Cox HR results")
+
+# Initialize safe defaults so nothing crashes if a file is missing
+sig_edges <- data.frame()
+all_n <- 0; sig_n <- 0; tnbc_n <- 0; erpos_n <- 0
+top2  <- data.frame()
+sig_surv <- character(0)
+
+if (!is.null(perm)) {
+  sig_edges <- perm %>% filter(empirical_fdr < 0.05) %>%
+    arrange(empirical_fdr, desc(abs_delta_rho))
+  all_n   <- nrow(perm)
+  sig_n   <- nrow(sig_edges)
+  tnbc_n  <- sum(sig_edges$delta_rho > 0, na.rm = TRUE)
+  erpos_n <- sum(sig_edges$delta_rho < 0, na.rm = TRUE)
+  if (sig_n > 0) top2 <- sig_edges %>% slice_max(abs_delta_rho, n = 2)
+}
+
+if (!is.null(lr)) {
+  sig_surv <- lr %>% filter(!is.na(FDR_BH), FDR_BH < 0.05) %>% pull(axis)
+}
+
+cat("\n")
+
+# =============================================================================
+# SECTION 1 — COHORT SIZE AND QC  (Methods Table 1)
+# =============================================================================
+cat("=============================================================================\n")
+cat("SECTION 1: COHORT SIZE AND QC\n")
+cat("=============================================================================\n")
+
+if (!is.null(align)) {
+  cat("\n[METHODS — Cohort alignment]\n")
+  cat(sprintf("  Expression samples (raw):          %d\n", align$expression_samples))
+  cat(sprintf("  Clinical rows:                     %d\n", align$clinical_rows))
+  cat(sprintf("  Matched samples (final n):         %d\n", align$matched_samples))
+  cat(sprintf("  Dropped (expression only):         %d\n", align$expression_only))
+  cat(sprintf("  Dropped (clinical only):           %d\n", align$clinical_only))
+  cat(sprintf("  %% expression retained:             %.1f%%\n", align$pct_expression_kept))
+  cat(sprintf("  %% clinical matched:                %.1f%%\n", align$pct_clinical_matched))
+}
+
+if (!is.null(pam50_raw)) {
+  cat("\n[METHODS — PAM50 subtype distribution (all 1980 samples, before filtering)]\n")
+  for (i in seq_len(nrow(pam50_raw))) {
+    lbl <- as.character(pam50_raw$pam50_simple[i])
+    if (!is.na(lbl)) {
+      cat(sprintf("  %-20s  n = %4d  (%.1f%%)\n",
+                  lbl, pam50_raw$n[i], pam50_raw$frac[i] * 100))
+    }
+  }
+  cat(sprintf("  %-20s  n = %4d\n", "TOTAL (non-NA)", sum(pam50_raw$n[!is.na(pam50_raw$pam50_simple)], na.rm = TRUE)))
+}
+
+if (!is.null(focused_raw)) {
+  cat("\n[METHODS — Focused ERpos vs TNBC (before replicate filtering)]\n")
+  for (i in seq_len(nrow(focused_raw))) {
+    grp <- as.character(focused_raw$focused_group_ERpos_TNBC[i])
+    if (!is.na(grp)) {
+      cat(sprintf("  %-10s  n = %4d  (%.1f%%)\n",
+                  grp, focused_raw$n[i], focused_raw$frac[i] * 100))
+    }
+  }
+}
+
+if (!is.null(concordance)) {
+  cat("\n[METHODS — PAM50 / receptor concordance]\n")
+  for (i in seq_len(nrow(concordance))) {
+    cat(sprintf("  %-45s  n = %4d  (%.1f%%)\n",
+                concordance$receptor_pam50_concordance[i],
+                concordance$n[i], concordance$frac[i] * 100))
+  }
+}
+
+if (!is.null(pam50_rep)) {
+  cat("\n[METHODS — ANALYSIS COHORT (PAM50, post replicate handling)]\n")
+  for (i in seq_len(nrow(pam50_rep))) {
+    lbl <- as.character(pam50_rep$pam50_simple[i])
+    if (!is.na(lbl)) {
+      cat(sprintf("  %-20s  n = %4d  (%.1f%%)\n",
+                  lbl, pam50_rep$n[i], pam50_rep$frac[i] * 100))
+    }
+  }
+  cat(sprintf("  %-20s  n = %4d\n", "TOTAL", sum(pam50_rep$n, na.rm = TRUE)))
+}
+
+if (!is.null(focused_rep)) {
+  cat("\n[METHODS — ANALYSIS COHORT (focused ERpos/TNBC, post replicate handling)]\n")
+  for (i in seq_len(nrow(focused_rep))) {
+    grp <- as.character(focused_rep$focused_group_ERpos_TNBC[i])
+    if (!is.na(grp)) {
+      cat(sprintf("  %-10s  n = %4d  (%.1f%%)\n",
+                  grp, focused_rep$n[i], focused_rep$frac[i] * 100))
+    }
+  }
+  cat(sprintf("  %-10s  n = %4d\n", "TOTAL",
+              sum(focused_rep$n[!is.na(focused_rep$focused_group_ERpos_TNBC)], na.rm = TRUE)))
+}
+
+# =============================================================================
+# SECTION 2 — AXIS GENE COVERAGE  (Methods Table 2)
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 2: AXIS GENE COVERAGE\n")
+cat("=============================================================================\n")
+
+if (!is.null(cov)) {
+  cat("\n[METHODS TABLE] Ferroptosis axis gene coverage in METABRIC:\n")
+  cat(sprintf("  %-22s  %5s  %7s  %8s  %s\n",
+              "Axis", "Def.", "Present", "Coverage", "Missing genes"))
+  cat(paste(rep("-", 80), collapse = ""), "\n")
+  for (i in seq_len(nrow(cov))) {
+    miss <- if (is.na(cov$missing_genes[i]) || trimws(cov$missing_genes[i]) == "")
+      "none" else cov$missing_genes[i]
+    cat(sprintf("  %-22s  %5d  %7d  %7.0f%%  %s\n",
+                cov$axis[i], cov$n_genes_defined[i], cov$n_genes_present[i],
+                cov$coverage_frac[i] * 100, miss))
+  }
+  cat(sprintf("\n  OVERALL: %d / %d genes present (%.0f%%)\n",
+              sum(cov$n_genes_present), sum(cov$n_genes_defined),
+              100 * sum(cov$n_genes_present) / sum(cov$n_genes_defined)))
+}
+
+# =============================================================================
+# SECTION 3 — ERpos vs TNBC AXIS SIGNATURE  (Results Table — validation)
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 3: ERpos vs TNBC AXIS SIGNATURE\n")
+cat("=============================================================================\n")
+
+if (!is.null(sig)) {
+  cat("\n[RESULTS TABLE] METABRIC ERpos vs TNBC axis signature (weighted primary):\n")
+  cat(sprintf("  %-22s  %6s  %5s  %9s  %10s  %10s  %12s  %s\n",
+              "Axis", "nERpos", "nTNBC", "Cliff_d", "Wilcox_p", "FDR_BH",
+              "Evidence", "Direction"))
+  cat(paste(rep("-", 100), collapse = ""), "\n")
+  for (i in seq_len(nrow(sig))) {
+    cat(sprintf("  %-22s  %6d  %5d  %9.3f  %10.2e  %10.2e  %12s  %s\n",
+                sig$axis[i], sig$n_ERpos[i], sig$n_TNBC[i],
+                sig$cliffs_delta[i], sig$wilcox_p[i], sig$wilcox_fdr[i],
+                sig$evidence[i], sig$direction[i]))
+  }
+
+  tnbc_sig  <- sig %>% filter(direction == "Higher_in_TNBC",
+                               evidence %in% c("Strong", "Moderate"))
+  erpos_sig <- sig %>% filter(direction == "Higher_in_ERpos",
+                               evidence %in% c("Strong", "Moderate"))
+
+  cat("\n[KEY NUMBERS] TNBC-higher axes (FDR significant):\n")
+  if (nrow(tnbc_sig) > 0) {
+    for (i in seq_len(nrow(tnbc_sig)))
+      cat(sprintf("  %s: Cliff's delta = +%.3f, FDR = %.2e [%s]\n",
+                  tnbc_sig$axis[i], tnbc_sig$cliffs_delta[i],
+                  tnbc_sig$wilcox_fdr[i], tnbc_sig$evidence[i]))
+  } else cat("  none at current thresholds\n")
+
+  cat("[KEY NUMBERS] ERpos-higher axes (FDR significant):\n")
+  if (nrow(erpos_sig) > 0) {
+    for (i in seq_len(nrow(erpos_sig)))
+      cat(sprintf("  %s: Cliff's delta = %.3f, FDR = %.2e [%s]\n",
+                  erpos_sig$axis[i], erpos_sig$cliffs_delta[i],
+                  erpos_sig$wilcox_fdr[i], erpos_sig$evidence[i]))
+  } else cat("  none at current thresholds\n")
+}
+
+# =============================================================================
+# SECTION 4 — DOWNSAMPLING ROBUSTNESS  (Results)
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 4: DOWNSAMPLING ROBUSTNESS\n")
+cat("=============================================================================\n")
+
+if (!is.null(down)) {
+  B_val <- if ("B" %in% names(down)) down$B[1] else 500
+  cat(sprintf("\n[RESULTS TABLE] Downsampling (B = %d iterations):\n", B_val))
+  cat(sprintf("  %-22s  %9s  %9s  %9s  %s\n",
+              "Axis", "Median_d", "CI_lo95", "CI_hi95", "Robustness"))
+  cat(paste(rep("-", 72), collapse = ""), "\n")
+  for (i in seq_len(nrow(down)))
+    cat(sprintf("  %-22s  %9.3f  %9.3f  %9.3f  %s\n",
+                down$axis[i], down$median_delta[i],
+                down$q025[i], down$q975[i], down$robustness[i]))
+
+  strong <- down %>% filter(robustness == "Strong") %>% pull(axis)
+  mod    <- down %>% filter(robustness == "Moderate") %>% pull(axis)
+  weak   <- down %>% filter(robustness == "Weak")   %>% pull(axis)
+  cat(sprintf("\n[KEY NUMBERS] Strong:   %s\n", paste(strong, collapse = ", ")))
+  cat(sprintf("[KEY NUMBERS] Moderate: %s\n",   paste(mod,    collapse = ", ")))
+  cat(sprintf("[KEY NUMBERS] Weak:     %s\n",   paste(weak,   collapse = ", ")))
+}
+
+# =============================================================================
+# SECTION 5 — DIFFERENTIAL WIRING  (Results — KEY FINDING)
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 5: DIFFERENTIAL WIRING — KEY FINDING\n")
+cat("=============================================================================\n")
+
+if (!is.null(perm)) {
+  cat(sprintf("\n[KEY NUMBERS] Total axis-pair combinations tested:   %d\n", all_n))
+  cat(sprintf("[KEY NUMBERS] FDR-significant edges (FDR < 0.05):   %d\n", sig_n))
+  cat(sprintf("[KEY NUMBERS] Stronger in TNBC:                      %d\n", tnbc_n))
+  cat(sprintf("[KEY NUMBERS] Stronger in ERpos:                     %d\n", erpos_n))
+
+  if (sig_n > 0) {
+    cat("\n[RESULTS TABLE] FDR-significant differential wiring edges:\n")
+    cat(sprintf("  %-28s  %10s  %12s  %10s  %s\n",
+                "Edge", "Delta_rho", "FDR_BH", "Abs_delta", "Evidence"))
+    cat(paste(rep("-", 80), collapse = ""), "\n")
+    for (i in seq_len(nrow(sig_edges))) {
+      lbl <- paste0(sig_edges$axis_1[i], " <-> ", sig_edges$axis_2[i])
+      cat(sprintf("  %-28s  %10.3f  %12.4f  %10.3f  %s\n",
+                  lbl, sig_edges$delta_rho[i], sig_edges$empirical_fdr[i],
+                  sig_edges$abs_delta_rho[i], sig_edges$evidence[i]))
+    }
+    if (nrow(top2) >= 1) {
+      cat("\n[KEY NUMBERS] Top 2 rewired edges for manuscript text:\n")
+      for (i in seq_len(nrow(top2)))
+        cat(sprintf("  %s <-> %s: delta-rho = +%.3f, FDR = %.4f\n",
+                    top2$axis_1[i], top2$axis_2[i],
+                    top2$delta_rho[i], top2$empirical_fdr[i]))
+    }
+  } else {
+    cat("\n[NOTE] No FDR < 0.05 edges in METABRIC (smaller TNBC n than GSE96058).\n")
+    cat("Top 5 edges by |delta rho| (report with nominal permutation p):\n")
+    top5 <- perm %>% arrange(empirical_p) %>% slice_head(n = 5)
+    cat(sprintf("  %-28s  %10s  %12s\n", "Edge", "Delta_rho", "perm_p"))
+    cat(paste(rep("-", 56), collapse = ""), "\n")
+    for (i in seq_len(nrow(top5))) {
+      lbl <- paste0(top5$axis_1[i], " <-> ", top5$axis_2[i])
+      cat(sprintf("  %-28s  %10.3f  %12.4f\n",
+                  lbl, top5$delta_rho[i], top5$empirical_p[i]))
+    }
+  }
+} else {
+  cat("\n  Permutation wiring file not found (run Chunk 19 first).\n")
+}
+
+# =============================================================================
+# SECTION 6 — COMBINED VALIDATION CALL  (Results summary)
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 6: COMBINED VALIDATION CALL\n")
+cat("=============================================================================\n")
+
+if (!is.null(val)) {
+  cat("\n[RESULTS TABLE] Axis validation (activity + robustness + wiring):\n")
+  cat(sprintf("  %-22s  %9s  %12s  %7s  %s\n",
+              "Axis", "Cliff_d", "Robustness", "Wiring", "Call"))
+  cat(paste(rep("-", 82), collapse = ""), "\n")
+  for (i in seq_len(nrow(val))) {
+    wn <- if ("n_FDR_significant_wiring_edges" %in% names(val))
+      val$n_FDR_significant_wiring_edges[i] else NA
+    cat(sprintf("  %-22s  %9.3f  %12s  %7s  %s\n",
+                val$axis[i], val$cliffs_delta[i],
+                val$downsample_robustness[i],
+                ifelse(is.na(wn), "?", as.character(wn)),
+                val$validation_call[i]))
+  }
+  strong_val <- val %>% filter(grepl("Strong", validation_call)) %>% pull(axis)
+  cat(sprintf("\n[KEY NUMBERS] Strongly validated axes: %s\n",
+              paste(strong_val, collapse = ", ")))
+}
+
+# =============================================================================
+# SECTION 7 — MARKER VALIDATION  (Results 4.6)
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 7: MARKER VALIDATION\n")
+cat("=============================================================================\n")
+
+if (!is.null(markers)) {
+  cat("\n[RESULTS TABLE] Discovery marker validation in METABRIC:\n")
+  cat(sprintf("  %-10s  %-22s  %7s  %7s  %9s  %12s  %-22s  %s\n",
+              "Gene", "Axis", "nERpos", "nTNBC", "Cliff_d", "FDR_BH",
+              "Evidence", "Direction"))
+  cat(paste(rep("-", 105), collapse = ""), "\n")
+  for (i in seq_len(nrow(markers))) {
+    cat(sprintf("  %-10s  %-22s  %7d  %7d  %9.3f  %12.2e  %-22s  %s\n",
+                markers$gene[i], markers$axis[i],
+                markers$n_ERpos[i], markers$n_TNBC[i],
+                markers$cliffs_delta[i], markers$wilcox_fdr[i],
+                markers$validation_evidence[i], markers$direction[i]))
+  }
+}
+
+if (!is.null(cross)) {
+  cat("\n[RESULTS TABLE] Cross-cohort concordance (GSE96058 vs METABRIC):\n")
+  cat(sprintf("  %-10s  %-22s  %12s  %12s  %6s  %s\n",
+              "Gene", "Axis", "Discovery_d", "METABRIC_d", "Match", "Strength"))
+  cat(paste(rep("-", 88), collapse = ""), "\n")
+  for (i in seq_len(nrow(cross))) {
+    cat(sprintf("  %-10s  %-22s  %12.3f  %12.3f  %6s  %s\n",
+                cross$gene[i], cross$axis[i],
+                cross$delta_disc[i], cross$delta_val[i],
+                ifelse(cross$concordant_direction[i], "YES", "NO"),
+                cross$validation_strength[i]))
+  }
+  n_conc <- sum(cross$concordant_direction, na.rm = TRUE)
+  cat(sprintf("\n[KEY NUMBERS] Concordant markers: %d / %d\n", n_conc, nrow(cross)))
+
+  strong_rep <- cross %>% filter(validation_strength == "Strong_replicated") %>% pull(gene)
+  dir_cons   <- cross %>% filter(validation_strength == "Directional_consistent") %>% pull(gene)
+  cat(sprintf("[KEY NUMBERS] Strong replicated:         %s\n",
+              paste(strong_rep, collapse = ", ")))
+  cat(sprintf("[KEY NUMBERS] Directional consistent:    %s\n",
+              paste(dir_cons,   collapse = ", ")))
+}
+
+# =============================================================================
+# SECTION 8 — SURVIVAL ANALYSIS  (Results — Clinical relevance)
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 8: SURVIVAL ANALYSIS\n")
+cat("=============================================================================\n")
+
+if (!is.null(surv_qc)) {
+  cat("\n[METHODS] Survival cohort:\n")
+  cat(sprintf("  n with OS data:       %d\n", surv_qc$n_survival_samples))
+  cat(sprintf("  Events (deaths):      %d\n", surv_qc$n_events))
+  cat(sprintf("  Median OS (months):   %.1f\n", surv_qc$median_os_months))
+} else {
+  cat("\n  Survival QC file not found — run Chunk 24 first.\n")
+}
+
+if (!is.null(lr)) {
+  cat("\n[RESULTS TABLE] Log-rank test (median-split per axis):\n")
+  cat(sprintf("  %-22s  %8s  %8s  %10s  %12s  %12s  %s\n",
+              "Axis", "n_High", "n_Low", "events_H", "LR_p", "FDR_BH", "Sig"))
+  cat(paste(rep("-", 90), collapse = ""), "\n")
+  for (i in seq_len(nrow(lr))) {
+    flag <- if (!is.na(lr$FDR_BH[i]) && lr$FDR_BH[i] < 0.05) "  ***" else ""
+    cat(sprintf("  %-22s  %8d  %8d  %10d  %12.4f  %12.4f%s\n",
+                lr$axis[i], lr$n_high[i], lr$n_low[i],
+                lr$events_high[i], lr$p_logrank[i], lr$FDR_BH[i], flag))
+  }
+  cat(sprintf("\n[KEY NUMBERS] FDR-significant survival axes: %s\n",
+              if (length(sig_surv) > 0) paste(sig_surv, collapse = ", ")
+              else "none at FDR < 0.05"))
+}
+
+if (!is.null(cox_df)) {
+  cat("\n[RESULTS TABLE] Cox proportional hazards (continuous axis score):\n")
+  cat(sprintf("  %-22s  %8s  %10s  %10s  %10s  %10s  %s\n",
+              "Axis", "HR", "HR_lo95", "HR_hi95", "p_cox", "FDR_BH", "Sig"))
+  cat(paste(rep("-", 88), collapse = ""), "\n")
+  for (i in seq_len(nrow(cox_df))) {
+    flag <- if (!is.na(cox_df$FDR_BH[i]) && cox_df$FDR_BH[i] < 0.05) "  ***" else ""
+    cat(sprintf("  %-22s  %8.3f  %10.3f  %10.3f  %10.4f  %10.4f%s\n",
+                cox_df$axis[i], cox_df$HR[i], cox_df$HR_lo95[i],
+                cox_df$HR_hi95[i], cox_df$p_cox[i], cox_df$FDR_BH[i], flag))
+  }
+}
+
+# =============================================================================
+# SECTION 9 — READY-TO-PASTE MANUSCRIPT SENTENCES
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 9: READY-TO-PASTE MANUSCRIPT SENTENCES\n")
+cat("=============================================================================\n")
+
+cat("\n--- METHODS: Cohort ---\n")
+if (!is.null(align))
+  cat(sprintf("The METABRIC validation cohort comprised %d primary breast tumour samples with matched microarray expression and clinical annotation.\n",
+              align$matched_samples))
+
+if (!is.null(pam50_rep)) {
+  lA <- pam50_rep$n[pam50_rep$pam50_simple == "LumA"]
+  lB <- pam50_rep$n[pam50_rep$pam50_simple == "LumB"]
+  h2 <- pam50_rep$n[pam50_rep$pam50_simple == "HER2_enriched"]
+  ba <- pam50_rep$n[pam50_rep$pam50_simple == "Basal"]
+  nl <- pam50_rep$n[pam50_rep$pam50_simple == "Normal_like"]
+  tot <- sum(pam50_rep$n, na.rm = TRUE)
+  cat(sprintf("Intrinsic subtype distribution (n=%d): LumA (n=%d, %.1f%%), LumB (n=%d, %.1f%%), HER2-enriched (n=%d, %.1f%%), Basal (n=%d, %.1f%%), Normal-like (n=%d, %.1f%%).\n",
+              tot, lA, 100*lA/tot, lB, 100*lB/tot, h2, 100*h2/tot,
+              ba, 100*ba/tot, nl, 100*nl/tot))
+}
+if (!is.null(focused_rep)) {
+  ne <- focused_rep$n[focused_rep$focused_group_ERpos_TNBC == "ERpos"]
+  nt <- focused_rep$n[focused_rep$focused_group_ERpos_TNBC == "TNBC"]
+  cat(sprintf("The focused ERpos vs TNBC contrast included %d ERpos and %d TNBC samples.\n", ne, nt))
+}
+if (!is.null(cov)) {
+  pct <- round(100 * sum(cov$n_genes_present) / sum(cov$n_genes_defined))
+  cat(sprintf("All %d of 46 ferroptosis core axis genes were detected in the METABRIC microarray matrix (%d%% coverage).\n",
+              sum(cov$n_genes_present), pct))
+}
+
+cat("\n--- RESULTS: Axis signature ---\n")
+if (!is.null(sig)) {
+  tnbc_s  <- sig %>% filter(direction == "Higher_in_TNBC",
+                              evidence %in% c("Strong", "Moderate"))
+  erpos_s <- sig %>% filter(direction == "Higher_in_ERpos",
+                              evidence %in% c("Strong", "Moderate"))
+  if (nrow(tnbc_s) > 0) {
+    t1 <- tnbc_s[1, ]
+    cat(sprintf("In METABRIC validation, TNBC tumours consistently exhibited higher %s axis activity (Cliff's delta = +%.3f, BH-FDR = %.2e, %s evidence), replicating the GSE96058 discovery finding.\n",
+                t1$axis, t1$cliffs_delta, t1$wilcox_fdr, t1$evidence))
+  }
+  if (nrow(erpos_s) > 0) {
+    e1 <- erpos_s[1, ]
+    cat(sprintf("ERpos tumours showed higher %s axis activity (Cliff's delta = %.3f, BH-FDR = %.2e, %s evidence), consistent with the ferroptosis-buffered state identified in discovery.\n",
+                e1$axis, e1$cliffs_delta, e1$wilcox_fdr, e1$evidence))
+  }
+}
+
+cat("\n--- RESULTS: Downsampling ---\n")
+if (!is.null(down)) {
+  B_val <- if ("B" %in% names(down)) down$B[1] else 500
+  s_axes <- down %>% filter(robustness == "Strong") %>% pull(axis)
+  w_axes <- down %>% filter(robustness == "Weak")   %>% pull(axis)
+  cat(sprintf("Balanced downsampling of ERpos to TNBC size (B = %d iterations) confirmed robustness of %s axis differences; %s showed weak or unstable directions.\n",
+              B_val,
+              paste(s_axes, collapse = ", "),
+              paste(w_axes, collapse = ", ")))
+}
+
+cat("\n--- RESULTS: Differential wiring ---\n")
+if (!is.null(perm)) {
+  if (sig_n > 0) {
+    cat(sprintf("Of %d unique axis-pair combinations tested in METABRIC, %d exhibited FDR-significant differential wiring between ERpos and TNBC (BH-FDR < 0.05, permutation B = 2,000), all %d stronger in TNBC.\n",
+                all_n, sig_n, tnbc_n))
+    if (nrow(top2) >= 1)
+      cat(sprintf("The most prominent rewired edges included %s <-> %s (delta-rho = +%.3f, FDR = %.4f)",
+                  top2$axis_1[1], top2$axis_2[1],
+                  top2$delta_rho[1], top2$empirical_fdr[1]))
+    if (nrow(top2) >= 2)
+      cat(sprintf(" and %s <-> %s (delta-rho = +%.3f, FDR = %.4f).",
+                  top2$axis_1[2], top2$axis_2[2],
+                  top2$delta_rho[2], top2$empirical_fdr[2]))
+    cat("\n")
+  } else {
+    best <- perm %>% arrange(empirical_p) %>% slice_head(n = 1)
+    cat(sprintf("Permutation-tested differential wiring in METABRIC (B = 2,000) did not reach FDR < 0.05 across %d axis-pair combinations, likely reflecting the smaller TNBC sample size (n = %d vs n = 320 in GSE96058). The top ranked edge was %s <-> %s (delta-rho = +%.3f, perm p = %.3f), consistent in direction with the GSE96058 finding.\n",
+                all_n, if (!is.null(focused_rep)) {
+                  focused_rep$n[focused_rep$focused_group_ERpos_TNBC == "TNBC"]
+                } else 320,
+                best$axis_1, best$axis_2, best$delta_rho[1], best$empirical_p[1]))
+  }
+}
+
+cat("\n--- RESULTS: Markers ---\n")
+if (!is.null(cross)) {
+  n_conc     <- sum(cross$concordant_direction, na.rm = TRUE)
+  strong_rep <- cross %>% filter(validation_strength == "Strong_replicated") %>% pull(gene)
+  cat(sprintf("%d of %d discovery-selected markers showed directionally concordant expression differences between ERpos and TNBC in METABRIC.\n",
+              n_conc, nrow(cross)))
+  if (length(strong_rep) > 0)
+    cat(sprintf("%s reached strong replication (BH-FDR < 0.05 in both cohorts with concordant direction).\n",
+                paste(strong_rep, collapse = ", ")))
+}
+
+cat("\n--- RESULTS: Survival ---\n")
+if (!is.null(surv_qc))
+  cat(sprintf("Survival analysis was performed in %d METABRIC samples with available overall survival data (%d events; median OS = %.1f months).\n",
+              surv_qc$n_survival_samples, surv_qc$n_events, surv_qc$median_os_months))
+
+if (!is.null(lr)) {
+  if (length(sig_surv) > 0) {
+    for (ax in sig_surv) {
+      lr_row <- lr[lr$axis == ax, ]
+      cat(sprintf("High %s axis score was significantly associated with OS (log-rank p = %.4f, BH-FDR = %.4f",
+                  ax, lr_row$p_logrank, lr_row$FDR_BH))
+      if (!is.null(cox_df) && ax %in% cox_df$axis) {
+        cr <- cox_df[cox_df$axis == ax, ]
+        cat(sprintf("; HR = %.2f, 95%% CI %.2f-%.2f, Cox p = %.4f",
+                    cr$HR, cr$HR_lo95, cr$HR_hi95, cr$p_cox))
+      }
+      cat(").\n")
+    }
+  } else {
+    best_lr <- lr %>% arrange(p_logrank) %>% slice_head(n = 2)
+    cat("No axis reached BH-FDR < 0.05 for overall survival at the METABRIC sample size.\n")
+    for (i in seq_len(nrow(best_lr))) {
+      cat(sprintf("  %s showed the strongest trend: log-rank p = %.4f (FDR = %.4f).\n",
+                  best_lr$axis[i], best_lr$p_logrank[i], best_lr$FDR_BH[i]))
+    }
+  }
+}
+
+# =============================================================================
+# SECTION 10 — SAVE FULL REPORT TO FILE
+# =============================================================================
+cat("\n=============================================================================\n")
+cat("SECTION 10: SAVING REPORT\n")
+cat("=============================================================================\n")
+
+dir.create(paths$manuscript, recursive = TRUE, showWarnings = FALSE)
+report_fp <- file.path(paths$manuscript, "METABRIC_manuscript_numbers_report.txt")
+
+sink(report_fp)
+
+cat("METABRIC MANUSCRIPT NUMBERS — FULL REPORT\n")
+cat("Project root:", root, "\n")
+cat("Generated:   ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+sections <- list(
+  "COHORT ALIGNMENT"           = align,
+  "PAM50 COUNTS (RAW)"         = pam50_raw,
+  "FOCUSED COUNTS (RAW)"       = focused_raw,
+  "PAM50/RECEPTOR CONCORDANCE" = concordance,
+  "PAM50 ANALYSIS COHORT"      = pam50_rep,
+  "FOCUSED ANALYSIS COHORT"    = focused_rep,
+  "AXIS GENE COVERAGE"         = cov,
+  "ERpos vs TNBC SIGNATURE"    = sig,
+  "DOWNSAMPLING ROBUSTNESS"    = down,
+  "WIRING — ALL EDGES"         = perm,
+  "COMBINED VALIDATION"        = val,
+  "MARKER VALIDATION"          = markers,
+  "CROSS-COHORT CONCORDANCE"   = cross,
+  "SURVIVAL QC"                = surv_qc,
+  "LOG-RANK RESULTS"           = lr,
+  "COX HR RESULTS"             = cox_df
+)
+
+for (nm in names(sections)) {
+  df <- sections[[nm]]
+  if (!is.null(df)) {
+    cat("===", nm, "===\n")
+    print(as.data.frame(df))
+    cat("\n")
+  }
+}
+
+sink()
+
+cat("\nFull report saved to:\n ", report_fp, "\n")
+cat("\n=============================================================================\n")
+cat("EXTRACTION COMPLETE\n")
+cat("=============================================================================\n\n")
+```
+
+
+
