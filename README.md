@@ -1,4 +1,4 @@
-# Proliferation- and purity-robust ferroptosis defense shift in Luminal B breast cancer
+# GCH1 predicts survival within luminal A but not luminal B breast cancer
 
 Analysis code for the manuscript by Amira Abozaid and colleagues.
 
@@ -8,10 +8,11 @@ expression data themselves, which must be obtained from their original
 repositories (see **Obtaining the raw data**).
 
 - **Paper:** [to be completed: full citation and DOI once published]
-- **Archived release:** [to be completed: Zenodo DOI]
-- **Licence:** [to be completed: e.g. MIT for code, CC BY 4.0 for derived tables]
+- **Archived release:** [10.5281/zenodo.23492210](https://doi.org/10.5281/zenodo.23492210)
+- **Licence:** MIT (see `LICENSE`)
 - **Contact:** Amira Abozaid, Biotechnology Program, Egypt-Japan University of
-  Science and Technology (E-JUST), Alexandria, Egypt
+  Science and Technology (E-JUST), Alexandria, Egypt.
+  <amira.abozaid@ejust.edu.eg>
 
 ---
 
@@ -130,6 +131,12 @@ reading the GSE96058 expression table. The analysis document takes a few minutes
 dominated by the 10,000-iteration permutation test in the `defense-correlation`
 chunk and the ESTIMATE scoring in `covariates`.
 
+**Chunk order.** `03_analysis_lean.Rmd` runs: `setup`, `load-cohorts`,
+`covariates`, `axis-level`, `gene-level`, `iron-and-balance`, `hepcidin`,
+`stratified`, `defense-correlation`, `fig-helpers`, `survival`, `figures`,
+`save`. The `fig-helpers` chunk defines the shared scales and label functions and
+must run before `survival`, because Figure 6 is drawn there.
+
 **Reproducibility.** The random seed is fixed at 123 before the permutation
 analysis. Everything else is deterministic.
 
@@ -161,16 +168,20 @@ Everything reported in the manuscript is written to `Lean/03_results/`.
 
 | File | Manuscript |
 |---|---|
-| `Fig1_Axis_Activity_Adjustment` | Figure 1 |
-| `Fig2_Discovery_Replication_Concordance` | Figure 2 |
+| `Fig1_Covariates_by_Subtype` | Figure 1 |
+| `Fig2_Axis_Activity_Adjustment` | Figure 2 |
 | `Fig3_Gene_Adjustment_Cascade` | Figure 3 |
 | `Fig4_Iron_Flux_and_Balance` | Figure 4 |
 | `Fig5_GCH1_SLC40A1_by_Subtype` | Figure 5 |
-| `FigS1_Covariates_by_Subtype` | Supplementary Figure 1 |
+| `Fig6_Survival_Within_Subtype` | Figure 6 |
+| `FigS1_Discovery_Replication_Concordance` | Supplementary Figure 1 |
 | `FigS2_Defense_Axis_Coexpression` | Supplementary Figure 2 |
 | `FigS3_Proliferation_Stratified` | Supplementary Figure 3 |
-| `FigS4_Survival_Balance` | Supplementary Figure 4 |
-| `Working_Hepcidin_Adjustment` | Not shown. Supports the post hoc hepcidin paragraph |
+| `FigS4_Hepcidin_Adjustment` | Supplementary Figure 4 |
+
+Figure 6 is built in the `survival` chunk, not in `figures`, because it needs the
+fitted Cox models. Supplementary Figure 4 is built in the `hepcidin` chunk. The
+remaining eight are built in `figures`.
 
 ### Tables (`Lean/03_results/tables/`)
 
@@ -224,9 +235,10 @@ chunks producing them are:
 Everything after those chunks in each document is exploratory and can be skipped
 without affecting any reported result.
 
-`03_analysis_lean.Rmd` contains no abandoned analyses. Its `hepcidin` chunk is a
-prespecified post hoc analysis that is reported in the manuscript as a negative
-result.
+`03_analysis_lean.Rmd` contains no abandoned analyses. Its `hepcidin` chunk is an
+exploratory post hoc analysis, run after the prespecified analyses were complete,
+and is reported in the manuscript as a negative result and as Supplementary
+Figure 4.
 
 ---
 
@@ -258,5 +270,16 @@ proliferation-stratified analysis.
 
 [to be completed: paper citation]
 
+Abozaid, A. (2026). Analysis code for *GCH1 predicts survival within luminal A
+but not luminal B breast cancer* [Software]. Zenodo.
+https://doi.org/10.5281/zenodo.23492210
+
 If you use the code or the derived tables, please cite both the paper and the
 archived release.
+
+## Licence
+
+The code in this repository is released under the MIT Licence; see `LICENSE` for
+the full text. The derived tables in `Lean/03_results/tables/` are covered by the
+same licence. Neither expression dataset is redistributed here, and each remains
+under the terms set by its original repository.
