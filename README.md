@@ -1,6 +1,15 @@
-# GCH1 predicts survival within luminal A but not luminal B breast cancer
+# Ferroptosis defence differences between luminal breast cancer subtypes are largely proliferation, and the survival association of GCH1 within luminal A is not specific to breast cancer death
 
 Analysis code for the manuscript by Amira Abozaid and colleagues.
+
+In brief: across GSE96058 and METABRIC, most of the difference in ferroptosis
+defence gene expression between luminal A and luminal B tumours follows
+proliferation. The *GCH1* minus *SLC40A1* balance score is associated with overall
+survival within luminal A in both cohorts, but in METABRIC, where cause of death is
+recorded, that association comes from deaths from other causes and not from breast
+cancer. The cause-of-death analyses were specified in writing
+(`PRESPECIFIED_revision_analyses.md`) and committed to this repository before they
+were run.
 
 This repository contains everything needed to reproduce the figures and tables of
 the paper from the two public expression datasets. It does not contain the
@@ -8,7 +17,8 @@ expression data themselves, which must be obtained from their original
 repositories (see **Obtaining the raw data**).
 
 - **Paper:** [to be completed: full citation and DOI once published]
-- **Archived release:** [10.5281/zenodo.23492210](https://doi.org/10.5281/zenodo.23492210)
+- **Archived release:** [10.5281/zenodo.23492209](https://doi.org/10.5281/zenodo.23492209)
+  (resolves to the most recent release)
 - **Licence:** MIT (see `LICENSE`)
 - **Contact:** Amira Abozaid, Biotechnology Program, Egypt-Japan University of
   Science and Technology (E-JUST), Alexandria, Egypt.
@@ -22,9 +32,14 @@ repositories (see **Obtaining the raw data**).
 |---|---|
 | `01_GSE96058_preprocessing.Rmd` | Builds the discovery cohort from the GEO series files |
 | `02_METABRIC_preprocessing.Rmd` | Builds the replication cohort from the cBioPortal archive |
-| `03_analysis_lean.Rmd` | All analyses reported in the manuscript, and every figure and table |
+| `03_analysis_lean.Rmd` | All main analyses reported in the manuscript, and every figure and main table |
+| `PRESPECIFIED_revision_analyses.md` | Written specification of the cause-of-death analyses, committed before they were run |
+| `revision_survival_checks.Rmd` | Cause-of-death, competing-risk, age and relapse analyses within luminal A (METABRIC) |
+| `R00_reproduction_check.csv` to `R04_RFS_LumA.csv` | Results of `revision_survival_checks.Rmd` (Supplementary Table 2) |
+| `R_SUMMARY.txt` | Plain-text summary of those results |
+| `R_session_info.txt` | Package versions of the run that produced those results |
 | `10_CORE_ferroptosis_axis_gene_membership.csv` | Curated ferroptosis axis definitions. An input, not an output |
-| `session_info.txt` | Package versions of the run that produced the reported results |
+| `session_info.txt` | Package versions of the run that produced the main results |
 | `README.md` | This file |
 
 `10_CORE_ferroptosis_axis_gene_membership.csv` is the only data file here. The
@@ -142,6 +157,49 @@ analysis. Everything else is deterministic.
 
 ---
 
+## Cause-of-death analyses
+
+Overall survival in METABRIC combines deaths from breast cancer and deaths from
+other causes. `revision_survival_checks.Rmd` divides the luminal A association by
+cause of death. The analyses and the rule for reading them were written down in
+`PRESPECIFIED_revision_analyses.md` and committed here before the document was run.
+
+**What it does.** Within luminal A tumours of METABRIC, and for both the balance
+score and *GCH1* alone:
+
+- A. cause-specific Cox models for death from breast cancer and for death from
+  other causes, with a Lunn-McNeil test of whether the two effects differ
+- B. a Fine-Gray model for breast cancer death with other-cause death as the
+  competing event, fitted in luminal A alone
+- C. correlation with age at diagnosis, and overall survival in patients younger
+  than 70
+- D. relapse-free survival
+
+Each model is fitted under the primary adjustment (PAM50 proliferation module and
+ESTIMATE score) and again with age, Nottingham Prognostic Index, endocrine therapy
+and chemotherapy added.
+
+**Built-in check.** Before fitting anything new, the document refits the published
+model and stops unless it reproduces the luminal A estimate for the balance score,
+HR 1.23 (95% CI 1.11 to 1.38).
+
+**How to run.** Run `02_METABRIC_preprocessing.Rmd` first. Then place
+`revision_survival_checks.Rmd` in a folder named `revision` inside the project
+root and render it:
+
+```r
+rmarkdown::render("revision/revision_survival_checks.Rmd")
+```
+
+It reads `METABRIC/02_processed/09_expr_PAM50_primary_repSAFE.rds` and
+`09_clin_PAM50_primary_repSAFE.rds`, recomputes the ESTIMATE scores exactly as
+`03_analysis_lean.Rmd` does, and writes only to `revision/output/`. It changes
+nothing in the main pipeline. The copies of its output in this repository
+(`R00` to `R04`, `R_SUMMARY.txt`, `R_session_info.txt`) are from the run reported
+in the manuscript.
+
+---
+
 ## What the analysis document consumes
 
 `03_analysis_lean.Rmd` reads exactly seven files and writes everything else.
@@ -211,7 +269,8 @@ remaining eight are built in `figures`.
 | `session_info.txt` | Package versions of that run |
 
 Supplementary Table 1 is `10_CORE_ferroptosis_axis_gene_membership.csv`, which is
-an input rather than a generated output.
+an input rather than a generated output. Supplementary Table 2 is built from the
+`R01` to `R04` files written by `revision_survival_checks.Rmd`.
 
 ---
 
@@ -270,9 +329,10 @@ proliferation-stratified analysis.
 
 [to be completed: paper citation]
 
-Abozaid, A. (2026). Analysis code for *GCH1 predicts survival within luminal A
-but not luminal B breast cancer* [Software]. Zenodo.
-https://doi.org/10.5281/zenodo.23492210
+Abozaid, A. (2026). Analysis code for *Ferroptosis defence differences between
+luminal breast cancer subtypes are largely proliferation, and the survival
+association of GCH1 within luminal A is not specific to breast cancer death*
+[Software]. Zenodo. https://doi.org/10.5281/zenodo.23492209
 
 If you use the code or the derived tables, please cite both the paper and the
 archived release.
