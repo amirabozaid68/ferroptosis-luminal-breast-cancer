@@ -1,0 +1,358 @@
+---
+title: "Revision analyses within luminal A (METABRIC)"
+subtitle: "Cause of death, competing risks, age and relapse. Prespecified in PRESPECIFIED_revision_analyses.md"
+author: "Amira Abozaid"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# This document READS METABRIC/02_processed and WRITES only to
+# revision/output. It changes nothing in the main pipeline.
+# Every object below is rebuilt exactly as in 03_analysis_lean.Rmd
+# (same cohort filter, z-scores, ESTIMATE call and Cox models).
+# ============================================================
+suppressPackageStartupMessages({
+  library(dplyr); library(tibble); library(readr); library(purrr)
+  library(matrixStats); library(survival)
+})
+if (!requireNamespace("tidyestimate", quietly = TRUE))
+  stop("tidyestimate is not installed. It is the same package the main analysis uses.")
+
+# Project root, resolved the same way as the main pipeline. When knitting,
+# R starts inside the revision folder, so without the here package the
+# parent folder is taken as the root.
+if (requireNamespace("here", quietly = TRUE)) {
+  root <- here::here()
+} else {
+  root <- Sys.getenv("FERR_ROOT",
+                     unset = normalizePath(file.path(getwd(), ".."), winslash = "/"))
+}
+mb_processed <- file.path(root, "METABRIC", "02_processed")
+out_dir      <- file.path(root, "revision", "output")
+if (!dir.exists(mb_processed))
+  stop("Cannot find ", mb_processed,
+       ". Put this file in a folder called 'revision' inside the project folder ",
+       "(the folder that holds GSE96058, METABRIC and Lean).")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+message("Project root: ", root)
+message("Writing results to: ", out_dir)
+set.seed(123)
+
+# ---- helpers copied from 03_analysis_lean.Rmd ----------------------------
+PAM50_PROLIF_GENES <- c("BIRC5", "CCNB1", "CDC20", "CDC6", "CENPF", "CEP55", "EXO1", "KIF2C", "MELK",
+                        "MKI67", "MYBL2", "NDC80", "NUF2", "ORC6", "PTTG1", "RRM2", "TYMS", "UBE2C", "UBE2T")
+
+make_gene_z <- function(em) {
+  rsd <- matrixStats::rowSds(em, na.rm = TRUE)
+  rsd[!is.finite(rsd) | rsd == 0] <- NA_real_
+  ez <- (em - rowMeans(em, na.rm = TRUE)) / rsd
+  ez[!is.finite(ez)] <- NA_real_
+  ez
+}
+
+run_estimate <- function(expr_log) {
+  filt <- tidyestimate::filter_common_genes(as.data.frame(expr_log), id = "hgnc_symbol",
+                                            tidy = FALSE, tell_missing = FALSE, find_alias = TRUE)
+  sc <- tidyestimate::estimate_score(filt, is_affymetrix = FALSE)
+  tibble(sample_id = sc$sample, estimate_score = sc$estimate)
+}
+
+z <- function(x) { x <- as.numeric(x); (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE) }
+
+normalise_event <- function(v) {
+  s <- toupper(trimws(as.character(v)))
+  out <- rep(NA_integer_, length(s))
+  out[grepl("^1:|DECEASED|RECURRED$", s)] <- 1L
+  out[grepl("^0:|LIVING|NOT RECURRED", s)] <- 0L
+  out
+}
+
+usable <- function(d, v) {
+  if (!v %in% names(d)) return(FALSE)
+  x <- d[[v]]
+  if (is.factor(x) || is.character(x)) return(length(unique(stats::na.omit(as.character(x)))) > 1)
+  any(is.finite(x)) && stats::sd(x, na.rm = TRUE) > 0
+}
+
+# Same rules as fit_one() in the main pipeline: complete cases,
+# about 10 events per estimated parameter, per-1-SD hazard ratio.
+fit_cox <- function(d, time, event, feature, covars, label) {
+  covars <- covars[vapply(covars, function(v) usable(d, v), logical(1))]
+  keep <- c(time, event, feature, covars)
+  d <- d[stats::complete.cases(d[, keep, drop = FALSE]), , drop = FALSE]
+  n_ev <- sum(d[[event]] == 1)
+  base <- tibble(analysis = label, feature = feature, n = nrow(d), n_events = n_ev,
+                 HR = NA_real_, HR_lo = NA_real_, HR_hi = NA_real_, p_value = NA_real_,
+                 ph_p = NA_real_, covariates = paste(covars, collapse = "+"), note = NA_character_)
+  if (nrow(d) < 30 || n_ev < 10 * (length(covars) + 1))
+    return(mutate(base, note = "too few events for a stable fit"))
+  f <- stats::as.formula(paste0("Surv(", time, ", ", event, ") ~ ",
+                                paste(c(feature, covars), collapse = " + ")))
+  fit <- tryCatch(coxph(f, data = d), error = function(e) NULL)
+  if (is.null(fit)) return(mutate(base, note = "model failed to converge"))
+  s  <- summary(fit)
+  ph <- tryCatch(cox.zph(fit)$table[feature, "p"], error = function(e) NA_real_)
+  mutate(base, n = s$n, n_events = s$nevent,
+         HR = unname(s$conf.int[feature, "exp(coef)"]),
+         HR_lo = unname(s$conf.int[feature, "lower .95"]),
+         HR_hi = unname(s$conf.int[feature, "upper .95"]),
+         p_value = unname(s$coefficients[feature, "Pr(>|z|)"]), ph_p = ph)
+}
+
+FEATURES <- c("GCH1_minus_SLC40A1", "GCH1")
+MODELS <- list(
+  "Proliferation module + ESTIMATE"     = c("prolif_module", "estimate_score"),
+  "Proliferation + ESTIMATE + clinical" = c("prolif_module", "estimate_score",
+                                            "age", "npi", "hormone_therapy", "chemotherapy")
+)
+fmt <- function(x) sprintf("%.2f", x)
+```
+
+```{r build-cohort}
+# ============================================================
+# 1. METABRIC luminal cohort, exactly as load_cohort() and
+#    build_covariates() build it in the main pipeline
+# ============================================================
+expr <- readRDS(file.path(mb_processed, "09_expr_PAM50_primary_repSAFE.rds"))
+clin <- readRDS(file.path(mb_processed, "09_clin_PAM50_primary_repSAFE.rds")) %>%
+  as.data.frame() %>% as_tibble() %>%
+  filter(pam50_simple %in% c("LumA", "LumB"), sample_id %in% colnames(expr)) %>%
+  mutate(luminal_subtype = factor(as.character(pam50_simple), levels = c("LumA", "LumB")))
+
+expr_log <- as.matrix(expr[, clin$sample_id, drop = FALSE])
+ez <- make_gene_z(expr_log)
+
+stopifnot(sum(clin$luminal_subtype == "LumA") == 700,
+          sum(clin$luminal_subtype == "LumB") == 475)
+
+pg  <- intersect(PAM50_PROLIF_GENES, rownames(ez))
+message("Running ESTIMATE (takes a few minutes)...")
+est <- run_estimate(expr_log)
+
+yes_no <- function(x) { x <- toupper(trimws(as.character(x)))
+  ifelse(x == "YES", 1L, ifelse(x == "NO", 0L, NA_integer_)) }
+num <- function(v) suppressWarnings(as.numeric(clin[[v]]))
+
+d0 <- tibble(
+  sample_id       = clin$sample_id,
+  luminal_subtype = clin$luminal_subtype,
+  os_time         = num("OS_MONTHS"),
+  os_event        = normalise_event(clin$OS_STATUS),
+  vital           = trimws(as.character(clin$VITAL_STATUS)),
+  rfs_time        = num("RFS_MONTHS"),
+  rfs_event       = normalise_event(clin$RFS_STATUS),
+  GCH1               = z(ez["GCH1", ]),
+  SLC40A1            = z(ez["SLC40A1", ]),
+  GCH1_minus_SLC40A1 = z(ez["GCH1", ] - ez["SLC40A1", ]),
+  prolif_module   = z(colMeans(ez[pg, , drop = FALSE], na.rm = TRUE)),
+  estimate_score  = z(est$estimate_score[match(clin$sample_id, est$sample_id)]),
+  age             = num("AGE_AT_DIAGNOSIS"),
+  npi             = num("NPI"),
+  hormone_therapy = yes_no(clin$HORMONE_THERAPY),
+  chemotherapy    = yes_no(clin$CHEMOTHERAPY)
+)
+
+lumA    <- d0 %>% filter(luminal_subtype == "LumA")
+lumA_os <- lumA %>% filter(is.finite(os_time), os_time > 0, !is.na(os_event))
+
+event_counts <- d0 %>% filter(is.finite(os_time), os_time > 0) %>%
+  dplyr::count(luminal_subtype, vital, name = "n")
+knitr::kable(event_counts, caption = "Vital status by subtype (blank = cause of death not recorded)")
+```
+
+```{r reproduction-check}
+# ============================================================
+# 2. Check before any new analysis (prespecified).
+#    Must reproduce the published luminal A overall survival
+#    estimate for the balance score: HR 1.23 (1.11 to 1.38).
+#    If it does not match, knitting stops here.
+# ============================================================
+repro <- fit_cox(lumA_os, "os_time", "os_event", "GCH1_minus_SLC40A1",
+                 MODELS[["Proliferation module + ESTIMATE"]], "Reproduction: LumA OS, primary model")
+got <- fmt(c(repro$HR, repro$HR_lo, repro$HR_hi))
+write_csv(repro, file.path(out_dir, "R00_reproduction_check.csv"))
+if (!identical(got, c("1.23", "1.11", "1.38")))
+  stop("Reproduction FAILED. Got HR ", got[1], " (", got[2], " to ", got[3],
+       ") instead of 1.23 (1.11 to 1.38). No new analysis was run.")
+message("Reproduction passed: HR ", got[1], " (", got[2], " to ", got[3], ").")
+
+# Secondary checks against the clinically adjusted numbers in the manuscript.
+# These warn but do not stop.
+soft <- map_dfr(c(GCH1_minus_SLC40A1 = "1.08", GCH1 = "1.21") %>% names(), function(f)
+  fit_cox(lumA_os, "os_time", "os_event", f,
+          MODELS[["Proliferation + ESTIMATE + clinical"]], "Reproduction: LumA OS, clinical model"))
+expected_soft <- c("1.08", "1.21")
+if (!identical(fmt(soft$HR), expected_soft))
+  warning("Clinical-model HRs (", paste(fmt(soft$HR), collapse = ", "),
+          ") differ from the manuscript (1.08, 1.21). Check before interpreting.")
+knitr::kable(bind_rows(repro, soft) %>% select(analysis, feature, n, n_events, HR, HR_lo, HR_hi, p_value),
+             digits = 3, caption = "Reproduction of published estimates")
+```
+
+```{r A-cause-specific}
+# ============================================================
+# A. Cause of death within luminal A (decisive analysis)
+#    1. cause-specific Cox, breast cancer death (other causes censored)
+#    2. cause-specific Cox, other-cause death (breast cancer deaths censored)
+#    3. Lunn-McNeil stacked model: feature-by-cause interaction
+# ============================================================
+known_cause <- c("Living", "Died of Disease", "Died of Other Causes")
+n_unknown_cause <- sum(lumA_os$os_event == 1 & !lumA_os$vital %in% known_cause)
+message("Luminal A deaths with no recorded cause, excluded from A and B: ", n_unknown_cause)
+
+cr <- lumA_os %>% filter(vital %in% known_cause) %>%
+  mutate(ev_bc  = as.integer(vital == "Died of Disease"),
+         ev_oth = as.integer(vital == "Died of Other Causes"))
+
+lunn_mcneil <- function(d, feature, covars) {
+  covars <- covars[vapply(covars, function(v) usable(d, v), logical(1))]
+  d <- d[stats::complete.cases(d[, c("os_time", feature, covars), drop = FALSE]), , drop = FALSE]
+  stk <- bind_rows(mutate(d, cause = "breast_cancer", ev = ev_bc),
+                   mutate(d, cause = "other",         ev = ev_oth)) %>%
+    mutate(cause = factor(cause, levels = c("breast_cancer", "other")))
+  rhs <- c(feature, paste0(feature, ":cause"),
+           if (length(covars)) paste0(covars, ":cause"), "strata(cause)")
+  fit <- tryCatch(coxph(stats::as.formula(paste("Surv(os_time, ev) ~", paste(rhs, collapse = " + "))),
+                        data = stk), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  term <- paste0(feature, ":causeother")
+  unname(summary(fit)$coefficients[term, "Pr(>|z|)"])
+}
+
+read_rule <- function(bc_hr, oth_hr, oth_lo, oth_hi, p_lm) {
+  if (any(is.na(c(bc_hr, oth_hr, oth_lo, oth_hi)))) return("Not evaluable")
+  if (oth_lo <= 1 && oth_hi >= 1 && bc_hr > 1) return("Cancer-specific")
+  if (oth_lo > 1 && !is.na(p_lm) && p_lm >= 0.05) return("Not cancer-specific")
+  "Unresolved"
+}
+
+resA <- imap_dfr(MODELS, function(cv, mod) map_dfr(FEATURES, function(f) {
+  bc  <- fit_cox(cr, "os_time", "ev_bc",  f, cv, "Breast cancer death")
+  oth <- fit_cox(cr, "os_time", "ev_oth", f, cv, "Other-cause death")
+  p_lm <- lunn_mcneil(cr, f, cv)
+  tibble(model = mod, feature = f,
+         bc_events = bc$n_events, bc_HR = bc$HR, bc_lo = bc$HR_lo, bc_hi = bc$HR_hi, bc_p = bc$p_value,
+         oth_events = oth$n_events, oth_HR = oth$HR, oth_lo = oth$HR_lo, oth_hi = oth$HR_hi, oth_p = oth$p_value,
+         p_lunn_mcneil = p_lm,
+         reading = read_rule(bc$HR, oth$HR, oth$HR_lo, oth$HR_hi, p_lm),
+         note = paste(na.omit(c(bc$note, oth$note)), collapse = "; "))
+}))
+write_csv(resA, file.path(out_dir, "R01_cause_specific_LumA.csv"))
+knitr::kable(resA %>% select(model, feature, bc_events, bc_HR, bc_lo, bc_hi,
+                             oth_events, oth_HR, oth_lo, oth_hi, p_lunn_mcneil, reading),
+             digits = 3, caption = "A. Cause-specific hazards within luminal A")
+```
+
+```{r B-fine-gray}
+# ============================================================
+# B. Fine-Gray within luminal A only (breast cancer death,
+#    other-cause death as the competing event)
+# ============================================================
+fg_fit <- function(d, feature, covars, mod) {
+  covars <- covars[vapply(covars, function(v) usable(d, v), logical(1))]
+  d <- d %>% mutate(cr_status = factor(case_when(
+    vital == "Died of Disease" ~ "disease",
+    vital == "Died of Other Causes" ~ "other",
+    TRUE ~ "censor"), levels = c("censor", "disease", "other")))
+  keep <- c("os_time", "cr_status", feature, covars)
+  d <- as.data.frame(d[stats::complete.cases(d[, keep, drop = FALSE]), keep, drop = FALSE])
+  n_ev <- sum(d$cr_status == "disease")
+  base <- tibble(model = mod, feature = feature, n = nrow(d), disease_events = n_ev,
+                 sHR = NA_real_, sHR_lo = NA_real_, sHR_hi = NA_real_, p_value = NA_real_, note = NA_character_)
+  if (n_ev < 10 * (length(covars) + 1)) return(mutate(base, note = "too few events for a stable fit"))
+  out <- tryCatch({
+    fgd <- finegray(Surv(os_time, cr_status) ~ ., data = d, etype = "disease")
+    m <- coxph(stats::as.formula(paste("Surv(fgstart, fgstop, fgstatus) ~",
+                                       paste(c(feature, covars), collapse = " + "))),
+               weights = fgwt, data = fgd)
+    s <- summary(m)
+    mutate(base, sHR = unname(s$conf.int[feature, "exp(coef)"]),
+           sHR_lo = unname(s$conf.int[feature, "lower .95"]),
+           sHR_hi = unname(s$conf.int[feature, "upper .95"]),
+           p_value = unname(s$coefficients[feature, "Pr(>|z|)"]))
+  }, error = function(e) mutate(base, note = paste("failed:", conditionMessage(e))))
+  out
+}
+resB <- imap_dfr(MODELS, function(cv, mod) map_dfr(FEATURES, ~ fg_fit(cr, .x, cv, mod)))
+write_csv(resB, file.path(out_dir, "R02_finegray_LumA.csv"))
+knitr::kable(resB, digits = 3, caption = "B. Fine-Gray subdistribution hazards within luminal A")
+```
+
+```{r C-age}
+# ============================================================
+# C. Age within luminal A
+#    1. Spearman correlation of each feature with age at diagnosis
+#    2. Overall survival model in patients younger than 70
+# ============================================================
+resC_cor <- map_dfr(FEATURES, function(f) {
+  ok <- is.finite(lumA[[f]]) & is.finite(lumA$age)
+  ct <- suppressWarnings(cor.test(lumA[[f]][ok], lumA$age[ok], method = "spearman", exact = FALSE))
+  tibble(feature = f, n = sum(ok), spearman_rho = unname(ct$estimate), p_value = ct$p.value)
+})
+under70 <- lumA_os %>% filter(age < 70)
+resC_os <- map_dfr(FEATURES, ~ fit_cox(under70, "os_time", "os_event", .x,
+                                       MODELS[["Proliferation module + ESTIMATE"]],
+                                       "LumA OS, age < 70, primary model"))
+write_csv(resC_cor, file.path(out_dir, "R03a_age_correlation_LumA.csv"))
+write_csv(resC_os,  file.path(out_dir, "R03b_OS_under70_LumA.csv"))
+knitr::kable(resC_cor, digits = 3, caption = "C1. Correlation with age at diagnosis, luminal A")
+knitr::kable(resC_os %>% select(analysis, feature, n, n_events, HR, HR_lo, HR_hi, p_value, ph_p),
+             digits = 3, caption = "C2. Overall survival, luminal A younger than 70")
+```
+
+```{r D-rfs}
+# ============================================================
+# D. Relapse-free survival within luminal A
+# ============================================================
+lumA_rfs <- lumA %>% filter(is.finite(rfs_time), rfs_time > 0, !is.na(rfs_event))
+resD <- imap_dfr(MODELS, function(cv, mod)
+  map_dfr(FEATURES, ~ fit_cox(lumA_rfs, "rfs_time", "rfs_event", .x, cv, paste("LumA RFS,", mod))))
+write_csv(resD, file.path(out_dir, "R04_RFS_LumA.csv"))
+knitr::kable(resD %>% select(analysis, feature, n, n_events, HR, HR_lo, HR_hi, p_value, ph_p),
+             digits = 3, caption = "D. Relapse-free survival within luminal A")
+```
+
+```{r summary}
+# ============================================================
+# Plain-text summary for the manuscript revision
+# ============================================================
+line_hr <- function(hr, lo, hi) ifelse(is.na(hr), "not fitted",
+                                       sprintf("HR %.2f (95%% CI %.2f to %.2f)", hr, lo, hi))
+summ <- c(
+  "REVISION ANALYSES, METABRIC LUMINAL A",
+  paste("Generated:", format(Sys.time(), "%Y-%m-%d %H:%M")),
+  "",
+  sprintf("Reproduction check passed: HR %s (%s to %s).", got[1], got[2], got[3]),
+  sprintf("Luminal A deaths with no recorded cause, excluded from A and B: %d", n_unknown_cause),
+  "",
+  "A. Cause-specific hazards",
+  unlist(pmap(resA, function(model, feature, bc_HR, bc_lo, bc_hi, oth_HR, oth_lo, oth_hi,
+                             p_lunn_mcneil, reading, ...)
+    sprintf("  %s | %s | breast cancer death %s | other-cause death %s | Lunn-McNeil P = %s | reading: %s",
+            feature, model, line_hr(bc_HR, bc_lo, bc_hi), line_hr(oth_HR, oth_lo, oth_hi),
+            ifelse(is.na(p_lunn_mcneil), "NA", sprintf("%.3g", p_lunn_mcneil)), reading))),
+  "",
+  "B. Fine-Gray within luminal A",
+  unlist(pmap(resB, function(model, feature, sHR, sHR_lo, sHR_hi, ...)
+    sprintf("  %s | %s | subdistribution %s", feature, model, line_hr(sHR, sHR_lo, sHR_hi)))),
+  "",
+  "C. Age",
+  unlist(pmap(resC_cor, function(feature, spearman_rho, p_value, ...)
+    sprintf("  %s with age: Spearman rho %.3f, P = %.3g", feature, spearman_rho, p_value))),
+  unlist(pmap(resC_os, function(feature, n, n_events, HR, HR_lo, HR_hi, ...)
+    sprintf("  %s, OS under 70 (n = %d, %d deaths): %s", feature, n, n_events, line_hr(HR, HR_lo, HR_hi)))),
+  "",
+  "D. Relapse-free survival within luminal A",
+  unlist(pmap(resD, function(analysis, feature, n_events, HR, HR_lo, HR_hi, ...)
+    sprintf("  %s | %s | %d events | %s", feature, analysis, n_events, line_hr(HR, HR_lo, HR_hi))))
+)
+writeLines(summ, file.path(out_dir, "R_SUMMARY.txt"))
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "R_session_info.txt"))
+cat(summ, sep = "\n")
+```
