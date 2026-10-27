@@ -7,7 +7,7 @@ the paper from the two public expression datasets. It does not contain the
 expression data themselves, which must be obtained from their original
 repositories (see **Obtaining the raw data**).
 
-- **Paper:** [to be completed: full citation and DOI once published]
+- **Paper:** 
 - **Archived release:** [10.5281/zenodo.23492210](https://doi.org/10.5281/zenodo.23492210)
 - **Licence:** MIT (see `LICENSE`)
 - **Contact:** Amira Abozaid, Biotechnology Program, Egypt-Japan University of
