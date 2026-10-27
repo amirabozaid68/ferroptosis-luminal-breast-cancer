@@ -1,0 +1,29 @@
+REVISION ANALYSES, METABRIC LUMINAL A
+Generated: 2026-10-27 10:15
+
+Reproduction check passed: HR 1.23 (1.11 to 1.38).
+Luminal A deaths with no recorded cause, excluded from A and B: 1
+
+A. Cause-specific hazards
+  GCH1_minus_SLC40A1 | Proliferation module + ESTIMATE | breast cancer death HR 1.11 (95% CI 0.92 to 1.33) | other-cause death HR 1.31 (95% CI 1.14 to 1.51) | Lunn-McNeil P = 0.146 | reading: Not cancer-specific
+  GCH1 | Proliferation module + ESTIMATE | breast cancer death HR 1.13 (95% CI 0.93 to 1.37) | other-cause death HR 1.31 (95% CI 1.13 to 1.51) | Lunn-McNeil P = 0.228 | reading: Not cancer-specific
+  GCH1_minus_SLC40A1 | Proliferation + ESTIMATE + clinical | breast cancer death HR 1.01 (95% CI 0.84 to 1.21) | other-cause death HR 1.13 (95% CI 0.98 to 1.31) | Lunn-McNeil P = 0.336 | reading: Cancer-specific
+  GCH1 | Proliferation + ESTIMATE + clinical | breast cancer death HR 1.10 (95% CI 0.91 to 1.32) | other-cause death HR 1.30 (95% CI 1.12 to 1.50) | Lunn-McNeil P = 0.173 | reading: Not cancer-specific
+
+B. Fine-Gray within luminal A
+  GCH1_minus_SLC40A1 | Proliferation module + ESTIMATE | subdistribution HR 1.03 (95% CI 0.88 to 1.21)
+  GCH1 | Proliferation module + ESTIMATE | subdistribution HR 1.03 (95% CI 0.88 to 1.21)
+  GCH1_minus_SLC40A1 | Proliferation + ESTIMATE + clinical | subdistribution HR 0.97 (95% CI 0.82 to 1.15)
+  GCH1 | Proliferation + ESTIMATE + clinical | subdistribution HR 0.99 (95% CI 0.85 to 1.16)
+
+C. Age
+  GCH1_minus_SLC40A1 with age: Spearman rho 0.151, P = 5.88e-05
+  GCH1 with age: Spearman rho 0.018, P = 0.626
+  GCH1_minus_SLC40A1, OS under 70 (n = 483, 207 deaths): HR 1.15 (95% CI 0.98 to 1.33)
+  GCH1, OS under 70 (n = 483, 207 deaths): HR 1.27 (95% CI 1.09 to 1.50)
+
+D. Relapse-free survival within luminal A
+  GCH1_minus_SLC40A1 | LumA RFS, Proliferation module + ESTIMATE | 230 events | HR 1.10 (95% CI 0.94 to 1.27)
+  GCH1 | LumA RFS, Proliferation module + ESTIMATE | 230 events | HR 1.15 (95% CI 0.98 to 1.34)
+  GCH1_minus_SLC40A1 | LumA RFS, Proliferation + ESTIMATE + clinical | 230 events | HR 1.06 (95% CI 0.91 to 1.24)
+  GCH1 | LumA RFS, Proliferation + ESTIMATE + clinical | 230 events | HR 1.13 (95% CI 0.97 to 1.32)
