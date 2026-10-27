@@ -1,3 +1,0 @@
-analysis,feature,n,n_events,HR,HR_lo,HR_hi,p_value,ph_p,covariates,note
-"LumA OS, age < 70, primary model",GCH1_minus_SLC40A1,483,207,1.1457093313385074,0.9837311943902459,1.3343582875093842,0.08028193131001354,0.920574527737366,prolif_module+estimate_score,NA
-"LumA OS, age < 70, primary model",GCH1,483,207,1.2746894500580528,1.0864667571390565,1.4955203952745875,0.0029079833311121826,0.4988210372946063,prolif_module+estimate_score,NA
