@@ -1,2 +1,0 @@
-cohort,endpoint,feature,sHR,sHR_lo,sHR_hi,p_value,note
-METABRIC,DSS (Fine-Gray subdistribution),GCH1_minus_SLC40A1,0.9412715023097881,0.8513668199325559,1.0406701557041094,0.23734434850475195,Subtype not stratified: finegray() does not accept strata
