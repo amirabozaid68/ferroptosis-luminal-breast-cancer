@@ -1,5 +1,0 @@
-analysis,feature,n,n_events,HR,HR_lo,HR_hi,p_value,ph_p,covariates,note
-"LumA RFS, Proliferation module + ESTIMATE",GCH1_minus_SLC40A1,698,230,1.0953079329991156,0.9447126910605552,1.2699093379850608,0.22769509959349574,0.38846619962532236,prolif_module+estimate_score,NA
-"LumA RFS, Proliferation module + ESTIMATE",GCH1,698,230,1.145632317123651,0.980594647541091,1.3384464307746569,0.0867027453316995,0.9506825951975818,prolif_module+estimate_score,NA
-"LumA RFS, Proliferation + ESTIMATE + clinical",GCH1_minus_SLC40A1,698,230,1.062656869272375,0.9127187560373086,1.237226269693976,0.4335602137993037,0.5087091787857202,prolif_module+estimate_score+age+npi+hormone_therapy+chemotherapy,NA
-"LumA RFS, Proliferation + ESTIMATE + clinical",GCH1,698,230,1.1334816176459777,0.9723367148410483,1.3213329888004592,0.10928598569134955,0.8696419560271949,prolif_module+estimate_score+age+npi+hormone_therapy+chemotherapy,NA
