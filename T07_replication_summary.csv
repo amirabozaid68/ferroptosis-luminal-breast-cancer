@@ -1,0 +1,5 @@
+adjustment,n_genes,same_direction,pearson_r_deltas,n_core
+Raw,36,31,0.7744167027739725,15
+MKI67,36,27,0.6282738421558339,7
+Proliferation module,36,28,0.7181620413467976,0
+Proliferation module + ESTIMATE,36,26,0.6956446698201989,0

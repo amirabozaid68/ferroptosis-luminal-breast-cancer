@@ -1,0 +1,28 @@
+STATISTICAL METHODS NOTES (for the Methods section)
+Subtypes: PAM50 LumA and LumB. Expression z-scored gene-wise within each cohort.
+Axis scores: equal-weight mean of member-gene z-scores; complete axes required in both cohorts.
+Effect size: Cliff's delta (LumB relative to LumA) computed as 2*AUC - 1, 95% CI from DeLong AUC variance.
+Tests: two-sided Wilcoxon rank-sum; BH-FDR within cohort x adjustment level x feature family.
+Adjustment: linear residualisation on MKI67, on the PAM50 proliferation-module mean z-score,
+  and on the proliferation module plus the ESTIMATE score (tidyestimate, non-Affymetrix mode).
+Frozen gene set: all genes of axes with BH-FDR < 0.05 raw and MKI67-corrected in GSE96058;
+  tested unchanged in METABRIC.
+Robust core: at 'Proliferation module + ESTIMATE', same sign as GSE96058 raw, BH-FDR < 0.05 and |delta| >= 0.147 in both cohorts.
+Stratified analysis: proliferation-module quintiles, weighted pooled delta, coin stratified Wilcoxon.
+Survival: Cox proportional hazards. Features z-scored within cohort, so each
+  hazard ratio is per 1 SD. PAM50 subtype entered as a stratification term, not a
+  covariate, so no proportional-hazards assumption is made between LumA and LumB.
+  Adjustment levels mirror the expression analysis; a clinicopathological model
+  adding age, Nottingham Prognostic Index and endocrine and chemotherapy use was
+  fitted in METABRIC only, because GSE96058 carries no stage, grade, size, node or
+  treatment data.
+Endpoints: overall survival in both cohorts (the only shared endpoint). In METABRIC,
+  breast-cancer-specific survival (other-cause deaths censored) and relapse-free
+  survival were prespecified secondary endpoints, because 351 of 693 METABRIC deaths
+  were from other causes. Disease-specific survival was repeated as a Fine-Gray
+  subdistribution model treating other-cause death as a competing risk.
+Proportional hazards assessed by scaled Schoenfeld residuals (cox.zph).
+BH-FDR within cohort x endpoint x model. Kaplan-Meier tertiles are display only.
+The equal-and-opposite constraint implied by the GCH1-minus-SLC40A1 score was tested
+  against the free two-gene model by a 1-df likelihood-ratio test.
+Co-regulation: within-subtype mean |Spearman r| among defense axes, 10000 label permutations.

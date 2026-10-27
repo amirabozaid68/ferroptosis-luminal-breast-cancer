@@ -1,0 +1,3 @@
+cohort,n_total,odds_ratio_LumB_vs_LumA,ci_low,ci_high,p_value,adjustment,test,analysis_status
+GSE96058,2084,0.5469580537740842,0.42961079783885686,0.6927928950388776,1.896485944120076e-7,Proliferation module + ESTIMATE,Fisher exact test on the favourable combination,"Exploratory, post hoc; not independent of SLC40A1"
+METABRIC,1175,0.6622559916707937,0.4973364187278402,0.8783311966023049,0.0033856924055173186,Proliferation module + ESTIMATE,Fisher exact test on the favourable combination,"Exploratory, post hoc; not independent of SLC40A1"
