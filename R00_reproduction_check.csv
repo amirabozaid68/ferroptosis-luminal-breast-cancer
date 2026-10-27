@@ -1,2 +1,0 @@
-analysis,feature,n,n_events,HR,HR_lo,HR_hi,p_value,ph_p,covariates,note
-"Reproduction: LumA OS, primary model",GCH1_minus_SLC40A1,700,378,1.2345493343989,1.1053006900685722,1.378911704986099,1.8820260989396614e-4,0.7434249913425559,prolif_module+estimate_score,NA
