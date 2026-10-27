@@ -1,9 +1,0 @@
-cohort,luminal_subtype,favourable,n,percent_within_subtype,adjustment
-GSE96058,LumA,All other combinations,1029,71.85754189944134,Proliferation module + ESTIMATE
-GSE96058,LumA,"High ferroportin, low hepcidin",403,28.14245810055866,Proliferation module + ESTIMATE
-GSE96058,LumB,All other combinations,537,82.36196319018404,Proliferation module + ESTIMATE
-GSE96058,LumB,"High ferroportin, low hepcidin",115,17.63803680981595,Proliferation module + ESTIMATE
-METABRIC,LumA,All other combinations,499,71.28571428571429,Proliferation module + ESTIMATE
-METABRIC,LumA,"High ferroportin, low hepcidin",201,28.714285714285715,Proliferation module + ESTIMATE
-METABRIC,LumB,All other combinations,375,78.94736842105263,Proliferation module + ESTIMATE
-METABRIC,LumB,"High ferroportin, low hepcidin",100,21.05263157894737,Proliferation module + ESTIMATE
