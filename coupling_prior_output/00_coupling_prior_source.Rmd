@@ -1,0 +1,277 @@
+---
+title: "GCH1 and SLC40A1 coupling in normal breast and in luminal tumours"
+subtitle: "Computational prior for the matched-normal tissue study"
+author: "Amira Abozaid"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+knit: >
+  (function(input, ...) {
+    dir.create("coupling_prior_output", showWarnings = FALSE)
+    rmarkdown::render(input, output_dir = "coupling_prior_output")
+  })
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# ============================================================
+# PREREGISTERED QUESTION (fill in, save, THEN knit)
+#
+#   Are GCH1 and SLC40A1 inversely correlated in normal breast
+#   tissue, and is that coupling retained in luminal A tumours
+#   and lost in luminal B tumours?
+#
+#   Primary statistic : partial Spearman rho between GCH1 and
+#                       SLC40A1, adjusted for an epithelial-content
+#                       score, computed separately in each group.
+#   Groups            : GTEx normal breast (female), TCGA breast
+#                       adjacent normal, TCGA LumA, TCGA LumB.
+#   Prediction        : .....................................
+#                       (write it here before knitting)
+#   Decision rule     : the tissue study proceeds only if the
+#                       adjusted rho is negative in normal breast.
+#
+#   Already known, unadjusted, from three cohorts:
+#     LumA  -0.154 (GSE96058)  -0.089 (METABRIC)  -0.0695 (TCGA)
+#     LumB  -0.029 (GSE96058)  -0.040 (METABRIC)  +0.0760 (TCGA)
+#     pooled LumA -0.121 (p 4.9e-10), LumB -0.017 (p 0.53),
+#     difference p 0.0021
+# ============================================================
+
+for (p in c("UCSCXenaTools", "dplyr", "tidyr", "ggplot2")) {
+  if (!requireNamespace(p, quietly = TRUE))
+    install.packages(p, repos = "https://cran.r-project.org")
+}
+library(UCSCXenaTools); library(dplyr); library(tidyr); library(ggplot2)
+
+# ---- every output of this document lands in one folder ----
+OUT <- "coupling_prior_output"
+dir.create(OUT, showWarnings = FALSE)
+out <- function(f) file.path(OUT, f)
+
+TOIL <- "https://toil.xenahubs.net"
+TCGA <- "https://tcga.xenahubs.net"
+
+GENES <- c(
+  "GCH1", "SLC40A1",                       # the axis
+  "EPCAM", "KRT8", "KRT18",                # epithelial content
+  "ADIPOQ", "FABP4", "PLIN1",              # adipocyte content
+  "PTPRC",                                 # immune content
+  "MKI67"                                  # proliferation, for context
+)
+set.seed(123)
+cat("All output will be written to:\n", normalizePath(OUT), "\n")
+```
+
+## 1. Expression, fetched gene by gene rather than downloaded whole
+
+`TcgaTargetGtex_rsem_gene_tpm` is a multi-gigabyte matrix. `fetch_dense_values()`
+asks the hub for named rows only, so this is a few seconds rather than an hour.
+Values are log2(TPM + 0.001). Spearman is rank-based, so the transform does not
+affect any statistic below.
+
+```{r fetch-expression}
+expr <- fetch_dense_values(
+  host         = TOIL,
+  dataset      = "TcgaTargetGtex_rsem_gene_tpm",
+  identifiers  = GENES,
+  use_probeMap = TRUE          # lets us ask by gene symbol, not Ensembl ID
+)
+expr <- as.data.frame(t(as.matrix(expr)))
+expr$sample <- rownames(expr)
+cat("samples returned:", nrow(expr), " genes returned:", ncol(expr) - 1, "\n")
+cat("genes the probeMap could not resolve:",
+    paste(setdiff(GENES, colnames(expr)), collapse = ", "), "\n")
+```
+
+## 2. Phenotype, small enough to download whole
+
+```{r fetch-phenotype, message=FALSE}
+ph <- XenaGenerate(subset = XenaHostNames == "toilHub") %>%
+  XenaFilter(filterDatasets = "TcgaTargetGTEX_phenotype") %>%
+  XenaQuery() %>% XenaDownload(destdir = OUT) %>% XenaPrepare()
+ph <- as.data.frame(ph)
+names(ph) <- make.names(names(ph))
+print(names(ph))
+head(ph)
+```
+
+The columns to look for are the study (`X_study`: GTEX or TCGA), the sample type
+(`X_sample_type`), the primary site (`X_primary_site`) and sex (`X_gender`). Column
+names vary slightly between Xena releases, so check the printed names above and
+adjust the three filters in section 4 if they do not match.
+
+## 3. PAM50 calls for the TCGA tumours
+
+```{r fetch-pam50, message=FALSE}
+clin <- XenaGenerate(subset = XenaHostNames == "tcgaHub") %>%
+  XenaFilter(filterDatasets = "BRCA_clinicalMatrix") %>%
+  XenaQuery() %>% XenaDownload(destdir = OUT) %>% XenaPrepare()
+clin <- as.data.frame(clin)
+names(clin) <- make.names(names(clin))
+print(grep("PAM50|pam50", names(clin), value = TRUE))   # expect PAM50Call_RNAseq
+pam <- clin %>%
+  select(sample = sampleID, pam50 = PAM50Call_RNAseq) %>%
+  filter(pam50 %in% c("LumA", "LumB"))
+table(pam$pam50)
+```
+
+## 4. Assemble the four groups
+
+```{r groups}
+d <- expr %>% left_join(ph, by = "sample")
+
+gtex_breast <- d %>%
+  filter(X_study == "GTEX", X_primary_site == "Breast", X_gender == "Female")
+
+tcga_norm <- d %>%
+  filter(X_study == "TCGA", X_sample_type == "Solid Tissue Normal",
+         grepl("Breast", X_primary_site))
+
+tcga_tum <- d %>%
+  filter(X_study == "TCGA", X_sample_type == "Primary Tumor",
+         grepl("Breast", X_primary_site)) %>%
+  mutate(short = substr(sample, 1, 15)) %>%
+  left_join(pam %>% mutate(short = substr(sample, 1, 15)) %>% select(-sample),
+            by = "short")
+
+groups <- list(
+  `GTEx normal breast`   = gtex_breast,
+  `TCGA adjacent normal` = tcga_norm,
+  `TCGA Luminal A`       = tcga_tum %>% filter(pam50 == "LumA"),
+  `TCGA Luminal B`       = tcga_tum %>% filter(pam50 == "LumB")
+)
+sizes <- sapply(groups, nrow)
+print(sizes)
+cat("\nExpected roughly: GTEx several hundred, adjacent normal ~100,",
+    "LumA 400-500, LumB ~200.\nA zero means a filter name needs fixing.\n")
+```
+
+## 5. Epithelial content, the adjustment that decides the result
+
+Normal breast is largely adipose. Two genes expressed in epithelium will correlate
+with each other across samples simply because some samples contain more epithelium,
+which would manufacture a positive correlation and mask a negative one. The score
+below is the mean z-score of the epithelial markers minus the mean z-score of the
+adipocyte markers, computed within each group so that no cross-group normalisation
+is implied.
+
+```{r epithelial-score}
+z <- function(x) as.numeric(scale(x))
+EPI <- c("EPCAM", "KRT8", "KRT18"); ADI <- c("ADIPOQ", "FABP4", "PLIN1")
+add_score <- function(df) {
+  if (nrow(df) == 0) { df$epi_score <- numeric(0); return(df) }
+  epi <- rowMeans(sapply(intersect(EPI, names(df)), function(g) z(df[[g]])))
+  adi <- rowMeans(sapply(intersect(ADI, names(df)), function(g) z(df[[g]])))
+  df$epi_score <- epi - adi
+  df
+}
+groups <- lapply(groups, add_score)
+```
+
+## 6. The four numbers
+
+Partial Spearman is computed as the correlation of the two genes after each has
+been regressed, on ranks, on the epithelial score. The unadjusted value is reported
+beside it so the size of the adjustment is visible.
+
+```{r correlations}
+pspear <- function(df) {
+  if (nrow(df) < 20)
+    return(tibble(n = nrow(df), rho_raw = NA_real_, rho_adj = NA_real_, p_adj = NA_real_))
+  x <- rank(df$GCH1); y <- rank(df$SLC40A1); c3 <- rank(df$epi_score)
+  rx <- residuals(lm(x ~ c3)); ry <- residuals(lm(y ~ c3))
+  ct_raw <- suppressWarnings(cor.test(df$GCH1, df$SLC40A1, method = "spearman"))
+  ct_adj <- suppressWarnings(cor.test(rx, ry, method = "pearson"))
+  tibble(n = nrow(df),
+         rho_raw = unname(ct_raw$estimate),
+         rho_adj = unname(ct_adj$estimate),
+         p_adj   = ct_adj$p.value)
+}
+res <- bind_rows(lapply(names(groups), function(g)
+  bind_cols(tibble(group = g), pspear(groups[[g]]))))
+knitr::kable(res, digits = 4,
+  caption = "GCH1 and SLC40A1: Spearman rho, unadjusted and adjusted for epithelial content")
+write.csv(res, out("coupling_prior_results.csv"), row.names = FALSE)
+```
+
+## 7. The verdict, read against the prespecified decision rule
+
+```{r verdict}
+g <- function(name, col) {
+  v <- res[[col]][res$group == name]
+  if (length(v) == 0 || is.na(v)) NA_real_ else v
+}
+gt <- g("GTEx normal breast", "rho_adj")
+an <- g("TCGA adjacent normal", "rho_adj")
+la <- g("TCGA Luminal A", "rho_adj")
+lb <- g("TCGA Luminal B", "rho_adj")
+
+verdict <- c(
+  sprintf("GTEx normal breast      adjusted rho = %s", format(round(gt, 4))),
+  sprintf("TCGA adjacent normal    adjusted rho = %s", format(round(an, 4))),
+  sprintf("TCGA Luminal A          adjusted rho = %s", format(round(la, 4))),
+  sprintf("TCGA Luminal B          adjusted rho = %s", format(round(lb, 4))),
+  "",
+  if (!is.na(gt) && gt < 0)
+    "NORMAL BREAST: coupling present. Decision rule met, the tissue study proceeds."
+  else
+    "NORMAL BREAST: no inverse coupling. Decision rule NOT met, do not start the tissue study.",
+  if (!is.na(la) && la < 0)
+    "LUMINAL A: coupling survives adjustment. The three-cohort result can go into the manuscript."
+  else
+    "LUMINAL A: coupling does not survive adjustment. Submit the manuscript unchanged.",
+  if (!is.na(lb) && abs(lb) < abs(la))
+    "LUMINAL B: weaker than luminal A, consistent with the asymmetry."
+  else
+    "LUMINAL B: not weaker than luminal A. The finding is about transformation, not subtype."
+)
+writeLines(verdict)
+writeLines(verdict, out("VERDICT.txt"))
+```
+
+## 8. Plot
+
+```{r plot, fig.width=7.2, fig.height=5.6}
+plt <- bind_rows(lapply(names(groups), function(g)
+  groups[[g]] %>% transmute(group = g, GCH1, SLC40A1)))
+plt$group <- factor(plt$group, levels = names(groups))
+lab <- res %>% transmute(group = factor(group, levels = names(groups)),
+  txt = sprintf("n = %d\nrho = %.2f (adjusted %.2f)", n, rho_raw, rho_adj))
+p <- ggplot(plt, aes(GCH1, SLC40A1)) +
+  geom_point(size = 0.7, alpha = 0.45) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.5) +
+  geom_text(data = lab, aes(x = -Inf, y = Inf, label = txt),
+            hjust = -0.08, vjust = 1.2, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ group, scales = "free") +
+  labs(title = "GCH1 against SLC40A1 in normal breast and in luminal tumours",
+       subtitle = "log2(TPM + 0.001), UCSC Toil recompute. Line is ordinary least squares, for display only.",
+       x = "GCH1", y = "SLC40A1") +
+  theme_bw(base_size = 9)
+p
+ggsave(out("coupling_prior.png"), p, width = 7.2, height = 5.6, dpi = 300)
+```
+
+## 9. Reading the output
+
+A negative adjusted rho in GTEx normal breast and in TCGA adjacent normal says the
+coupling exists in untransformed tissue, which is the premise of the tissue study.
+
+A negative adjusted rho in Luminal A and one near zero in Luminal B reproduces the
+three-cohort pattern and makes the tissue study a test of a stated prediction.
+
+A negative rho in both luminal subtypes means the finding concerns transformation
+rather than subtype, which is a different paper and still worth writing.
+
+A rho near zero in the normals kills the hypothesis, and that is the most valuable
+of the four outcomes, because it costs a week instead of a year.
+
+```{r session}
+file.copy("00_coupling_prior.Rmd", out("00_coupling_prior_source.Rmd"), overwrite = TRUE)
+writeLines(capture.output(sessionInfo()), out("session_info.txt"))
+cat("\nFiles written to", normalizePath(OUT), ":\n")
+print(list.files(OUT))
+sessionInfo()
+```

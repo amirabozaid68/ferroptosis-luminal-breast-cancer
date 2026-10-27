@@ -1,0 +1,8 @@
+GTEx normal breast      adjusted rho = 0.0516
+TCGA adjacent normal    adjusted rho = 0.4417
+TCGA Luminal A          adjusted rho = 0.0245
+TCGA Luminal B          adjusted rho = 0.1477
+
+NORMAL BREAST: no inverse coupling. Decision rule NOT met, do not start the tissue study.
+LUMINAL A: coupling does not survive adjustment. Submit the manuscript unchanged.
+LUMINAL B: not weaker than luminal A. The finding is about transformation, not subtype.
