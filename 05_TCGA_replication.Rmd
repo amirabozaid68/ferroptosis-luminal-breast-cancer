@@ -1,0 +1,273 @@
+---
+title: "TCGA-BRCA as a third cohort for the GCH1 and SLC40A1 balance score"
+subtitle: "Same estimators, adjustment ladder and matching as 03_analysis_lean.Rmd"
+author: "Amira Abozaid"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r prespecification}
+# ============================================================
+# WRITTEN BEFORE KNITTING. Save, commit to GitHub, THEN knit.
+#
+# Replication criterion for the balance score (GCH1 minus SLC40A1),
+# taken unchanged from the two-cohort analysis:
+#   1. primary adjustment (proliferation module + ESTIMATE):
+#      delta > 0, BH-FDR < 0.05 and delta >= 0.147
+#   2. matched on the PAM50 proliferation module:
+#      delta > 0 and |delta| above the 95th percentile of 1,000
+#      random gene pairs scored in the same matched tumours
+# GCH1 and SLC40A1 alone are reported beside it, not judged.
+# ============================================================
+```
+
+```{r setup, message=FALSE, warning=FALSE}
+for (p in c("UCSCXenaTools", "dplyr", "tidyr", "tibble", "readr", "purrr",
+            "matrixStats", "pROC", "tidyestimate", "here", "data.table")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cran.r-project.org")
+}
+suppressPackageStartupMessages({
+  library(UCSCXenaTools); library(dplyr); library(tidyr); library(tibble)
+  library(readr); library(purrr); library(matrixStats); library(pROC)
+})
+
+root  <- here::here()
+paths <- list(raw     = file.path(root, "TCGA/01_raw"),
+              tables  = file.path(root, "TCGA/03_results/tables"))
+invisible(lapply(paths, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+SPEC  <- list(seed = 123, fdr = 0.05, min_delta = 0.147)
+MATCH <- list(caliper = 0.2, n_null = 1000, trim_lo = 0.05, trim_hi = 0.95)
+set.seed(SPEC$seed)
+
+PAM50_PROLIF_GENES <- c("BIRC5","CCNB1","CDC20","CDC6","CENPF","CEP55","EXO1","KIF2C","MELK",
+                        "MKI67","MYBL2","NDC80","NUF2","ORC6","PTTG1","RRM2","TYMS","UBE2C","UBE2T")
+NONPAM50_PROLIF <- c("PCNA","MCM2","MCM3","MCM4","MCM5","MCM6","MCM7","CDK1","CCNA2","CCNB2",
+                     "TOP2A","AURKA","AURKB","PLK1","BUB1","BUB1B","TTK","CDC25A","E2F1","FEN1",
+                     "RFC4","GINS1","GINS2","KIF11","KIF23","RACGAP1","ASPM","DLGAP5","TPX2","PRC1")
+ADJ_LEVELS <- list("Raw" = character(0), "MKI67" = "mki67",
+                   "Proliferation module" = "prolif_module",
+                   "Proliferation module + ESTIMATE" = c("prolif_module", "estimate_score"))
+FEATURES <- c("GCH1", "SLC40A1", "GCH1_minus_SLC40A1")
+```
+
+```{r helpers}
+# Copied unchanged from 03_analysis_lean.Rmd
+make_gene_z <- function(em) {
+  rsd <- matrixStats::rowSds(em, na.rm = TRUE)
+  rsd[!is.finite(rsd) | rsd == 0] <- NA_real_
+  ez <- (em - rowMeans(em, na.rm = TRUE)) / rsd
+  ez[!is.finite(ez)] <- NA_real_
+  ez
+}
+residualize <- function(y, covs) {
+  d <- data.frame(y = y, covs, check.names = FALSE)
+  ok <- stats::complete.cases(d)
+  out <- rep(NA_real_, length(y))
+  if (sum(ok) < 50) return(out)
+  fit <- stats::lm(y ~ ., data = d[ok, , drop = FALSE])
+  out[ok] <- d$y[ok] - stats::predict(fit, newdata = d[ok, , drop = FALSE])
+  out
+}
+group_test <- function(y, grp) {
+  a <- y[grp == "LumA" & is.finite(y)]; b <- y[grp == "LumB" & is.finite(y)]
+  if (length(a) < 10 || length(b) < 10)
+    return(tibble(n_LumA = length(a), n_LumB = length(b), delta = NA_real_,
+                  delta_lo = NA_real_, delta_hi = NA_real_, p_value = NA_real_))
+  r  <- pROC::roc(controls = a, cases = b, direction = "<", quiet = TRUE)
+  ci <- as.numeric(pROC::ci.auc(r, method = "delong"))
+  tibble(n_LumA = length(a), n_LumB = length(b),
+         delta = 2 * ci[2] - 1, delta_lo = 2 * ci[1] - 1, delta_hi = 2 * ci[3] - 1,
+         p_value = stats::wilcox.test(b, a, exact = FALSE)$p.value)
+}
+fast_delta <- function(a, b) {
+  a <- a[is.finite(a)]; b <- b[is.finite(b)]
+  if (length(a) < 10 || length(b) < 10) return(NA_real_)
+  r <- rank(c(a, b))
+  2 * ((sum(r[(length(a) + 1):(length(a) + length(b))]) -
+          length(b) * (length(b) + 1) / 2) / (length(a) * length(b))) - 1
+}
+smd <- function(x, g) {
+  a <- x[g == "LumA"]; b <- x[g == "LumB"]
+  (mean(b, na.rm = TRUE) - mean(a, na.rm = TRUE)) / sqrt((var(a, na.rm = TRUE) + var(b, na.rm = TRUE)) / 2)
+}
+match_11 <- function(score, grp, caliper) {
+  cal <- caliper * sd(score, na.rm = TRUE)
+  ia <- which(grp == "LumA"); ib <- which(grp == "LumB")
+  used <- rep(FALSE, length(ia)); ka <- integer(0); kb <- integer(0)
+  for (j in ib[order(score[ib])]) {
+    d <- abs(score[ia] - score[j]); d[used] <- Inf
+    k <- which.min(d)
+    if (length(k) && is.finite(d[k]) && d[k] <= cal) { used[k] <- TRUE; ka <- c(ka, ia[k]); kb <- c(kb, j) }
+  }
+  sort(c(ka, kb))
+}
+```
+
+## 1. Expression and PAM50 calls
+
+TCGA-BRCA Illumina HiSeq RNA-seq, log2(RSEM normalised count + 1), from the
+UCSC Xena TCGA hub. PAM50 calls are the `PAM50Call_RNAseq` field distributed
+with the clinical matrix, taken as supplied and not recomputed, as in the
+other two cohorts.
+
+```{r download, message=FALSE}
+options(timeout = 3600)   # R's default of 60 s cuts the 61 MB matrix short
+
+# Downloads once, checks the file is complete, and reuses it on later knits.
+# A truncated file from a failed attempt is deleted and fetched again.
+get_xena <- function(pattern) {
+  q <- XenaGenerate(subset = XenaHostNames == "tcgaHub") %>%
+    XenaFilter(filterDatasets = pattern) %>% XenaQuery()
+  f <- file.path(paths$raw, basename(q$url))
+  ok_gz <- function(f) file.exists(f) && (!grepl("\\.gz$", f) ||
+    !inherits(try(readLines(gzfile(f), n = 1e6, warn = FALSE), silent = TRUE), "try-error"))
+  if (!ok_gz(f)) {
+    if (file.exists(f)) { message("Removing incomplete file: ", f); file.remove(f) }
+    utils::download.file(q$url, f, mode = "wb", method = "libcurl")
+  }
+  if (!ok_gz(f)) stop("Download still incomplete: ", f,
+                      "\nDownload it in your browser from ", q$url, " and save it as ", f)
+  message(basename(f), ": ", round(file.size(f) / 1e6, 1), " MB")
+  as.data.frame(data.table::fread(f))
+}
+expr_raw <- get_xena("TCGA.BRCA.sampleMap/HiSeqV2$")
+clin_raw <- get_xena("TCGA.BRCA.sampleMap/BRCA_clinicalMatrix$")
+stopifnot(nrow(expr_raw) > 15000, ncol(expr_raw) > 1000)   # ~20,530 genes x ~1,218 samples
+
+expr <- as.matrix(expr_raw[, -1]); rownames(expr) <- toupper(trimws(expr_raw[[1]]))
+storage.mode(expr) <- "numeric"
+# Older HGNC symbols used in this matrix, renamed to current ones
+ALIAS <- c(ORC6L = "ORC6", CDCA1 = "NUF2", KIAA0101 = "PCLAF")
+hit <- names(ALIAS)[names(ALIAS) %in% rownames(expr) & !(ALIAS %in% rownames(expr))]
+rownames(expr)[match(hit, rownames(expr))] <- ALIAS[hit]
+stopifnot(!anyDuplicated(rownames(expr)))
+
+need <- c("GCH1", "SLC40A1", PAM50_PROLIF_GENES)
+miss <- setdiff(need, rownames(expr))
+if (length(miss)) stop("Missing required genes: ", paste(miss, collapse = ", "))
+```
+
+```{r cohort}
+# Primary tumours only (barcode type 01), one tumour per patient, PAM50 LumA or LumB
+clin <- clin_raw %>%
+  transmute(sample_id = sampleID, pam50 = PAM50Call_RNAseq) %>%
+  filter(sample_id %in% colnames(expr),
+         substr(sample_id, 14, 15) == "01",
+         pam50 %in% c("LumA", "LumB")) %>%
+  mutate(patient = substr(sample_id, 1, 12)) %>%
+  arrange(sample_id) %>% distinct(patient, .keep_all = TRUE) %>%
+  mutate(luminal_subtype = factor(pam50, levels = c("LumA", "LumB")))
+
+expr_log <- expr[, clin$sample_id]
+ez <- make_gene_z(expr_log)
+grp <- as.character(clin$luminal_subtype)
+print(table(grp))
+```
+
+## 2. Covariates
+
+```{r covariates}
+filt <- tidyestimate::filter_common_genes(as.data.frame(expr_log), id = "hgnc_symbol",
+                                          tidy = FALSE, tell_missing = FALSE, find_alias = TRUE)
+est  <- tidyestimate::estimate_score(filt, is_affymetrix = FALSE)
+
+ng  <- intersect(NONPAM50_PROLIF, rownames(ez))
+cov <- tibble(sample_id = colnames(ez),
+              mki67 = as.numeric(ez["MKI67", ]),
+              prolif_module = colMeans(ez[PAM50_PROLIF_GENES, ], na.rm = TRUE),
+              prolif_nonpam50 = colMeans(ez[ng, , drop = FALSE], na.rm = TRUE)) %>%
+  left_join(tibble(sample_id = est$sample, stromal = est$stromal,
+                   immune = est$immune, estimate_score = est$estimate), by = "sample_id")
+stopifnot(identical(cov$sample_id, clin$sample_id))
+message("Non-PAM50 proliferation genes used: ", length(ng), " of ", length(NONPAM50_PROLIF))
+
+covariate_res <- map_dfr(c("mki67", "prolif_module", "stromal", "immune", "estimate_score"),
+  ~ group_test(cov[[.x]], grp) %>% mutate(feature = .x, .before = 1))
+print(covariate_res)
+```
+
+## 3. Balance score at four adjustment levels
+
+```{r adjustment-ladder}
+fm <- rbind(ez[c("GCH1", "SLC40A1"), ], GCH1_minus_SLC40A1 = ez["GCH1", ] - ez["SLC40A1", ])
+
+ladder <- imap_dfr(ADJ_LEVELS, function(vars, lvl) {
+  map_dfr(FEATURES, function(f) {
+    y <- as.numeric(fm[f, ])
+    if (length(vars)) y <- residualize(y, cov[, vars, drop = FALSE])
+    group_test(y, grp) %>% mutate(feature = f, .before = 1)
+  }) %>% mutate(FDR_BH = p.adjust(p_value, "BH"), adjustment = lvl)
+})
+print(ladder)
+```
+
+## 4. Matched on proliferation, with the random-pair null
+
+```{r matched}
+run_match <- function(score_name) {
+  pm <- cov[[score_name]]
+  lo <- quantile(pm[grp == "LumB"], MATCH$trim_lo, na.rm = TRUE)
+  hi <- quantile(pm[grp == "LumA"], MATCH$trim_hi, na.rm = TRUE)
+  sup <- which(is.finite(pm) & pm >= lo & pm <= hi)
+  mi  <- sup[match_11(pm[sup], grp[sup], MATCH$caliper)]
+  res <- map_dfr(FEATURES, ~ group_test(as.numeric(fm[.x, mi]), grp[mi]) %>%
+                   mutate(feature = .x, .before = 1))
+  list(mi = mi, res = res %>% mutate(matched_on = score_name),
+       balance = tibble(matched_on = score_name,
+                        n_pairs = sum(grp[mi] == "LumA"),
+                        smd_all = smd(pm, grp), smd_matched = smd(pm[mi], grp[mi]),
+                        balance_ok = abs(smd(pm[mi], grp[mi])) < 0.1))
+}
+runs <- map(c("prolif_module", "prolif_nonpam50", "mki67"), run_match)
+matched_balance <- map_dfr(runs, "balance"); print(matched_balance)
+matched_res     <- map_dfr(runs, "res");     print(matched_res)
+
+# Controls in the primary matched set
+mi  <- runs[[1]]$mi; isA <- grp[mi] == "LumA"
+d1  <- function(y) fast_delta(y[isA], y[!isA])
+set.seed(SPEC$seed)
+pool  <- setdiff(rownames(ez), c("GCH1", "SLC40A1", PAM50_PROLIF_GENES))
+pairs <- matrix(sample(pool, 2 * MATCH$n_null, replace = TRUE), ncol = 2)
+nullc <- apply(pairs, 1, function(p) d1(as.numeric(ez[p[1], mi] - ez[p[2], mi])))
+obs   <- matched_res$delta[matched_res$matched_on == "prolif_module" &
+                           matched_res$feature == "GCH1_minus_SLC40A1"]
+controls <- tibble(
+  positive_control_prolif_module = d1(colMeans(ez[PAM50_PROLIF_GENES, mi])),
+  null_pair_95th_abs = quantile(abs(nullc), 0.95, na.rm = TRUE),
+  balance_delta_matched = obs,
+  empirical_p = (1 + sum(abs(nullc) >= abs(obs), na.rm = TRUE)) / (1 + sum(is.finite(nullc))))
+print(controls)
+```
+
+## 5. Within-subtype correlation and verdict
+
+```{r verdict}
+pair_corr <- map_dfr(c("LumA", "LumB"), function(s) {
+  ids <- grp == s
+  ct <- suppressWarnings(cor.test(ez["GCH1", ids], ez["SLC40A1", ids], method = "spearman", exact = FALSE))
+  tibble(luminal_subtype = s, n = sum(ids), spearman_rho = unname(ct$estimate), p_value = ct$p.value)
+})
+print(pair_corr)
+
+prim <- ladder %>% filter(adjustment == "Proliferation module + ESTIMATE", feature == "GCH1_minus_SLC40A1")
+rule1 <- prim$delta > 0 && prim$FDR_BH < SPEC$fdr && prim$delta >= SPEC$min_delta
+rule2 <- controls$balance_delta_matched > 0 &&
+         abs(controls$balance_delta_matched) > controls$null_pair_95th_abs
+writeLines(c(sprintf("Primary adjustment: delta = %.2f (%.2f to %.2f), FDR = %.2g -> %s",
+                     prim$delta, prim$delta_lo, prim$delta_hi, prim$FDR_BH,
+                     if (rule1) "REPLICATES" else "does not replicate"),
+             sprintf("Matched: delta = %.2f, null 95th = %.2f, empirical P = %.3f -> %s",
+                     controls$balance_delta_matched, controls$null_pair_95th_abs,
+                     controls$empirical_p, if (rule2) "REPLICATES" else "does not replicate")))
+
+out <- list(T_TCGA_covariates = covariate_res, T_TCGA_ladder = ladder,
+            T_TCGA_matched_balance = matched_balance, T_TCGA_matched = matched_res,
+            T_TCGA_matched_controls = controls, T_TCGA_pair_corr = pair_corr)
+iwalk(out, ~ write_csv(.x, file.path(paths$tables, paste0(.y, ".csv"))))
+writeLines(capture.output(sessionInfo()), file.path(paths$tables, "session_info.txt"))
+```
